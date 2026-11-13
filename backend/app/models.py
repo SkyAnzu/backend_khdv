@@ -1,9 +1,9 @@
 """Validated input/output models for the week 1-2 scheduling prototype."""
 
-from datetime import date
+from datetime import date, datetime
 import re
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, StrictInt, field_validator, model_validator
 
 
 TIME_PATTERN = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
@@ -110,6 +110,98 @@ class ScheduleRequest(BaseModel):
         if len(shift_ids) != len(set(shift_ids)):
             raise ValueError("shift ids must be unique")
         return self
+
+
+class _HourlyCallKey(BaseModel):
+    date: date
+    hour: StrictInt = Field(ge=0, le=23)
+    group_id: str
+
+    @field_validator("date", mode="before")
+    @classmethod
+    def date_is_iso(cls, value: object) -> object:
+        if isinstance(value, datetime):
+            raise ValueError("date must use ISO format YYYY-MM-DD")
+        if isinstance(value, date):
+            return value
+        if not isinstance(value, str) or not DATE_PATTERN.fullmatch(value):
+            raise ValueError("date must use ISO format YYYY-MM-DD")
+        try:
+            date.fromisoformat(value)
+        except ValueError as error:
+            raise ValueError("date must be a valid calendar date") from error
+        return value
+
+    @field_validator("group_id")
+    @classmethod
+    def group_id_is_non_empty(cls, value: str) -> str:
+        return validate_non_empty(value.strip(), "group id")
+
+
+class HourlyCallObservation(_HourlyCallKey):
+    calls: StrictInt = Field(ge=0)
+
+    @field_validator("calls")
+    @classmethod
+    def calls_fit_finite_forecast(cls, value: int) -> int:
+        try:
+            float(value)
+        except OverflowError as error:
+            raise ValueError("calls is too large for a finite forecast") from error
+        return value
+
+
+class ForecastTarget(_HourlyCallKey):
+    pass
+
+
+class ForecastRequest(BaseModel):
+    history: list[HourlyCallObservation] = Field(min_length=1)
+    targets: list[ForecastTarget] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def forecast_inputs_are_valid(self) -> "ForecastRequest":
+        history_keys = [
+            (point.date, point.hour, point.group_id) for point in self.history
+        ]
+        if len(history_keys) != len(set(history_keys)):
+            raise ValueError("history date/hour/group keys must be unique")
+
+        target_keys = [
+            (point.date, point.hour, point.group_id) for point in self.targets
+        ]
+        if len(target_keys) != len(set(target_keys)):
+            raise ValueError("forecast target keys must be unique")
+
+        first_target_date = min(point.date for point in self.targets)
+        if any(point.date >= first_target_date for point in self.history):
+            raise ValueError("history dates must be before the forecast horizon")
+
+        sample_counts: dict[tuple[int, int, str], int] = {}
+        for point in self.history:
+            key = (point.date.weekday(), point.hour, point.group_id)
+            sample_counts[key] = sample_counts.get(key, 0) + 1
+
+        if any(
+            sample_counts.get(
+                (point.date.weekday(), point.hour, point.group_id), 0
+            )
+            < 2
+            for point in self.targets
+        ):
+            raise ValueError(
+                "each target needs at least two prior same weekday/hour/group samples"
+            )
+        return self
+
+
+class HourlyForecast(_HourlyCallKey):
+    forecast_calls: float = Field(ge=0, allow_inf_nan=False)
+    sample_count: StrictInt = Field(ge=2)
+
+
+class ForecastResponse(BaseModel):
+    forecasts: list[HourlyForecast] = Field(min_length=1)
 
 
 class Assignment(BaseModel):
