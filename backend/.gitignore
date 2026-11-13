@@ -1,0 +1,35 @@
+# Backend-generated files
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+*.log
+
+# Local AI/agent tooling (do not ignore project Markdown or user reports)
+opencode.json
+opencode.jsonc
+.opencode/
+.superpowers/
+.workbuddy-ai/
+coreach.md
+AGENTS.md
+CLAUDE.md
+GEMINI.md
+.cursor/
+.claude/
+.codex/
+.windsurf/
+.continue/
+.aider/
+.aider.conf.yml
+
+# Local secret material
+.env
+.env.*
+!.env.example
+secrets/
+*.secret
+*.pem
+*.key

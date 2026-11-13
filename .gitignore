@@ -1,0 +1,39 @@
+# Python environments, caches and test output
+.venv/
+backend/.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+*.log
+
+# Local AI/agent material (do not ignore normal Markdown or user reports)
+coreach.md
+opencode.json
+opencode.jsonc
+.opencode/
+.superpowers/
+.workbuddy-ai/
+AGENTS.md
+CLAUDE.md
+GEMINI.md
+.cursor/
+.claude/
+.codex/
+.windsurf/
+.continue/
+.aider/
+.aider.conf.yml
+docs/superpowers/
+
+# Local secret material
+.env
+.env.*
+!.env.example
+secrets/
+*.secret
+*.pem
+*.key
