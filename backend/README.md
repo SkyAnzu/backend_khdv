@@ -12,5 +12,6 @@
 ```
 
 Dependency source duy nhất của prototype là `backend/requirements.txt`. Solver
-v1 giữ nguyên hai rule cũ; `app/solver_v2.py` là module tuần độc lập, chưa nối
-vào API. Xem README tại repo root để biết input/output và giới hạn v2.
+v1 giữ nguyên hai rule cũ; `app/solver_v2.py` vẫn không có route riêng, nhưng
+được gọi bởi pipeline prototype `POST /api/schedule-v2`. Xem README tại repo
+root để biết input/output và giới hạn.

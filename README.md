@@ -3,7 +3,8 @@
 Prototype backend A được tách độc lập từ `BTL/backend/`. Repo này **chưa** là
 backend contract v1.0.0 trên remote khác. Solver cũ trong
 `backend/app/solver.py` vẫn là prototype tuần 1–2 với hai quy tắc; module solver
-tuần v2 được thêm riêng trong `backend/app/solver_v2.py` và chưa nối vào API.
+tuần v2 ở `backend/app/solver_v2.py` được pipeline gọi qua API prototype
+`POST /api/schedule-v2`.
 
 ## Cài đặt và kiểm tra trên Windows
 
@@ -32,8 +33,9 @@ Sample khả thi phải trả `OPTIMAL` hoặc `FEASIBLE`; sample không khả t
 
 ## Tính Erlang C trực tiếp
 
-Module nội bộ nhận số calls/giờ, AHT và mục tiêu SLA; không có route HTTP. Ví dụ
-12 calls/giờ, AHT 300 giây, SLA 0.8 trong 20 giây cần 3 nhân viên:
+Module nội bộ nhận số calls/giờ, AHT và mục tiêu SLA; không có route Erlang C
+độc lập. Pipeline API prototype gọi module này. Ví dụ 12 calls/giờ, AHT 300
+giây, SLA 0.8 trong 20 giây cần 3 nhân viên:
 
 ```powershell
 .\.venv\Scripts\python.exe -c "from backend.app.models import ErlangCRequest; from backend.app.erlang_c import calculate_required_staff; request=ErlangCRequest.model_validate({'calls_per_hour':12,'aht_seconds':300,'target_sla':0.8,'waiting_seconds':20}); print(calculate_required_staff(request).model_dump_json())"
@@ -45,8 +47,9 @@ không đạt target trong giới hạn sẽ ném `ValueError`, không phải tr
 ## Pipeline nội bộ: forecast/Erlang C → solver tuần v2
 
 `backend.app.pipeline.run_pipeline(PipelineRequest)` ghép hai nguồn nhu cầu với
-Erlang C và `solve_schedule_v2()`. Đây là interface Python nội bộ, không phải
-route/API; `/api/solver-preview` không đổi. AHT và ngưỡng chờ tính bằng giây,
+Erlang C và `solve_schedule_v2()`. `POST /api/schedule-v2` gọi pipeline này như
+một API local prototype; endpoint chưa phải contract sản phẩm/frontend đã chốt.
+`/api/solver-preview` không đổi. AHT và ngưỡng chờ tính bằng giây,
 SLA là tỷ lệ từ 0 đến 1; các tham số Erlang C dùng chung cho mọi nhóm trong
 request. Kết quả `service_level` là ước lượng Erlang C theo nhóm, không phải cam
 kết SLA cho pool nhân viên đa kỹ năng.
@@ -107,10 +110,12 @@ forecast (chỉ mode history), calls và service level theo giờ, requirements 
 slot, cùng response solver nguyên trạng gồm status, `stage_two_status` và
 warnings. Kiểm tra cả pipeline bằng pytest ở mục cài đặt.
 
-## Solver tuần v2 (module Python nội bộ)
+## Solver tuần v2 (module Python và pipeline API prototype)
 
 `backend.app.solver_v2.solve_schedule_v2()` là module mới, độc lập với solver
-v1. Không có route cho v2; `POST /api/solver-preview` và các model v1 không đổi.
+v1. Không có route gọi solver v2 trực tiếp; pipeline API prototype ở
+`POST /api/schedule-v2` dùng solver v2. `POST /api/solver-preview` và các model
+v1 không đổi.
 Lưới lập lịch gồm slot 30 phút và ca cố định 90 phút. Kỳ lập lịch là đúng 7 ngày
 Monday–Sunday; mỗi ca phải có ba slot liên tục cùng ngày. Người dùng khai báo
 các `shift_starts` có thể dùng, solver không tự tạo giờ bắt đầu.
@@ -181,8 +186,8 @@ tách riêng khỏi `INFEASIBLE`.
 
 Giới hạn cứng để chặn model quá lớn: 50 nhân viên, 10 nhóm, 336 operating slots,
 200 ca bắt đầu, 3.360 dòng nhu cầu và tối đa 30 giây solve. Không hỗ trợ nghỉ
-giữa ca, ca qua ngày, múi giờ/DST hoặc route/API cho pipeline. Chạy test v2 cùng
-toàn bộ backend bằng lệnh pytest ở phần trên.
+giữa ca, ca qua ngày hoặc múi giờ/DST. Chạy test v2 cùng toàn bộ backend bằng
+lệnh pytest ở phần trên.
 
 ## Chạy API local
 
@@ -191,8 +196,35 @@ toàn bộ backend bằng lệnh pytest ở phần trên.
 ```
 
 - `GET http://127.0.0.1:8000/health`
-- `POST http://127.0.0.1:8000/api/solver-preview`
+- `POST http://127.0.0.1:8000/api/solver-preview` — solver prototype v1 cũ.
+- `POST http://127.0.0.1:8000/api/schedule-v2` — pipeline API prototype, contract
+  tạm thời để thử nghiệm, chưa chốt với frontend.
 - Swagger: `http://127.0.0.1:8000/docs`
 
-Chưa có auth, database, public deployment hoặc API lịch nghiệp vụ tuần 3 trong
-prototype này. Không đưa secret vào repo; không chạy tunnel với dữ liệu thật.
+Trong Swagger, chọn `POST /api/schedule-v2` → **Try it out** rồi gửi nội dung
+`backend\samples\pipeline-planned-calls-request.json` hoặc
+`backend\samples\pipeline-history-request.json`. Hai request chỉ dùng dữ liệu
+tổng hợp; response tương ứng được lưu ở `pipeline-planned-calls-response.json`
+và `pipeline-history-response.json` trong cùng thư mục.
+PowerShell cũng có thể gửi trực tiếp sample:
+
+```powershell
+Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/api/schedule-v2 -ContentType "application/json" -InFile "backend\samples\pipeline-planned-calls-request.json"
+Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/api/schedule-v2 -ContentType "application/json" -InFile "backend\samples\pipeline-history-request.json"
+```
+
+Response trả `mode`, forecast (null ở mode planned), kết quả Erlang theo giờ,
+requirements 30 phút và response solver gồm nguyên trạng status, phase status
+và warnings. `INFEASIBLE`, `UNKNOWN` và `MODEL_INVALID` là kết quả HTTP 200 của
+solver; validation và lỗi miền tính toán trả HTTP 422. Request validation của
+endpoint mới không lặp giá trị input trong lỗi; `/api/solver-preview` vẫn giữ
+hành vi cũ. Hàm route là đồng bộ để FastAPI chạy nó trong threadpool; giới hạn
+solver tối đa 30 giây vẫn giữ nguyên.
+
+Response trong file `*-response.json` là mẫu thực đã nhận từ request tổng hợp;
+status và assignment có thể khác nếu solver dừng ở `FEASIBLE`, nhưng schema và
+ý nghĩa status được giữ nguyên.
+
+Prototype chưa có auth, database, public deployment hoặc contract sản phẩm đã
+chốt. Chỉ chạy trên loopback với sample/dữ liệu đã khử định danh; không đưa
+secret vào repo và không chạy tunnel với dữ liệu thật.
