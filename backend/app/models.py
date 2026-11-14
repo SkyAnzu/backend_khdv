@@ -3,11 +3,19 @@
 from datetime import date, datetime
 import re
 
-from pydantic import BaseModel, Field, StrictInt, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    StrictFloat,
+    StrictInt,
+    field_validator,
+    model_validator,
+)
 
 
 TIME_PATTERN = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
 DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+MAX_ERLANG_C_AGENTS = 10_000
 
 
 def validate_time(value: str) -> str:
@@ -202,6 +210,33 @@ class HourlyForecast(_HourlyCallKey):
 
 class ForecastResponse(BaseModel):
     forecasts: list[HourlyForecast] = Field(min_length=1)
+
+
+class ErlangCRequest(BaseModel):
+    calls_per_hour: StrictFloat = Field(ge=0, allow_inf_nan=False)
+    aht_seconds: StrictFloat = Field(ge=0, allow_inf_nan=False)
+    target_sla: StrictFloat = Field(gt=0, lt=1, allow_inf_nan=False)
+    waiting_seconds: StrictFloat = Field(ge=0, allow_inf_nan=False)
+    max_agents: StrictInt = Field(
+        default=MAX_ERLANG_C_AGENTS,
+        ge=1,
+        le=MAX_ERLANG_C_AGENTS,
+    )
+
+    @model_validator(mode="after")
+    def aht_is_positive_for_nonzero_calls(self) -> "ErlangCRequest":
+        if self.calls_per_hour > 0 and self.aht_seconds <= 0:
+            raise ValueError("AHT seconds must be positive when calls are nonzero")
+        return self
+
+
+class ErlangCResponse(BaseModel):
+    required_staff: StrictInt = Field(ge=0)
+    service_level: StrictFloat | None = Field(
+        ge=0,
+        le=1,
+        allow_inf_nan=False,
+    )
 
 
 class Assignment(BaseModel):
