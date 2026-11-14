@@ -10,7 +10,7 @@ htmlcov/
 .ruff_cache/
 *.log
 
-# Local AI/agent material (do not ignore normal Markdown or user reports)
+# Local AI/agent material (keep normal Markdown tracked; reports are ignored below)
 coreach.md
 opencode.json
 opencode.jsonc
@@ -28,6 +28,7 @@ GEMINI.md
 .aider/
 .aider.conf.yml
 docs/superpowers/
+/docs/reports/
 
 # Local secret material
 .env
