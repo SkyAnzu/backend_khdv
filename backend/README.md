@@ -11,5 +11,6 @@
 .\.venv\Scripts\python.exe -m uvicorn backend.app.main:app --reload --host 127.0.0.1 --port 8000
 ```
 
-Dependency source duy nhất của prototype là `backend/requirements.txt`. Phạm vi
-solver hiện tại chỉ là hai rule v1; các task A3+ chưa được claim hoàn tất.
+Dependency source duy nhất của prototype là `backend/requirements.txt`. Solver
+v1 giữ nguyên hai rule cũ; `app/solver_v2.py` là module tuần độc lập, chưa nối
+vào API. Xem README tại repo root để biết input/output và giới hạn v2.
