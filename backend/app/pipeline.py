@@ -12,6 +12,7 @@ from pydantic import (
     StrictFloat,
     StrictInt,
     StrictStr,
+    ValidationError,
     field_validator,
     model_validator,
 )
@@ -49,6 +50,14 @@ MAX_HOURLY_SLOTS = min(MAX_WEEK_DAYS * 23, MAX_OPERATING_SLOTS // 2)
 MAX_HISTORY_ROWS = 100_000
 MAX_HOURLY_CALL_ROWS = MAX_HOURLY_SLOTS * MAX_GROUPS
 DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+class PipelineDomainError(ValueError):
+    """A pipeline domain failure with distinct internal and public messages."""
+
+    def __init__(self, internal_message: str, *, public_message: str):
+        super().__init__(internal_message)
+        self.public_message = public_message
 
 
 def _parse_date(value: object) -> date:
@@ -309,16 +318,26 @@ def run_pipeline(request: PipelineRequest) -> PipelineResponse:
                     max_agents=request.max_agents,
                 )
             )
+        except ValidationError:
+            raise
         except ValueError as error:
-            raise ValueError(
+            raise PipelineDomainError(
                 f"Erlang C failed for {day.isoformat()} {hour:02d}:00 "
-                f"group {group_id!r}: {error}"
+                f"group {group_id!r}: {error}",
+                public_message=(
+                    "Erlang C could not meet the staffing target within "
+                    f"max_agents={request.max_agents}."
+                ),
             ) from error
         if erlang.required_staff > MAX_EMPLOYEES:
-            raise ValueError(
+            raise PipelineDomainError(
                 f"Erlang C requires {erlang.required_staff} agents for "
                 f"{day.isoformat()} {hour:02d}:00 group {group_id!r}, "
-                f"exceeding solver v2's per-slot limit of {MAX_EMPLOYEES}"
+                f"exceeding solver v2's per-slot limit of {MAX_EMPLOYEES}",
+                public_message=(
+                    "Erlang C staffing exceeds the solver v2 limit of "
+                    f"{MAX_EMPLOYEES} employees per group/slot."
+                ),
             )
         hourly_results.append(
             PipelineHourlyResult(

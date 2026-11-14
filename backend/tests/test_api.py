@@ -223,6 +223,50 @@ def test_schedule_v2_returns_domain_errors_as_422_without_traceback():
     assert "Traceback" not in response.text
 
 
+def test_schedule_v2_sanitizes_internal_validation_error_input_values():
+    marker = "PRIVATE-MARKER-7f2a"
+    request = load_sample("pipeline-history-request.json")
+    request["groups"] = [marker]
+    request["operating_hours"] = [{"date": "2026-11-02", "hour": 9}]
+    request["history"] = [
+        {
+            "date": "2026-10-26",
+            "hour": 9,
+            "group_id": marker,
+            "calls": 0,
+        }
+    ]
+    request["employees"][0]["skills"] = [marker]
+
+    response = client.post("/api/schedule-v2", json=request)
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "detail": "History has insufficient prior samples for one or more targets."
+    }
+    assert marker not in response.text
+    assert "input_value" not in response.text
+
+
+def test_schedule_v2_sanitizes_domain_error_but_keeps_safe_limit_context():
+    marker = "PRIVATE-MARKER-7f2a"
+    request = load_sample("pipeline-planned-calls-request.json")
+    request["groups"] = [marker]
+    request["planned_calls"] = [
+        {**item, "group_id": marker} for item in request["planned_calls"]
+    ]
+    request["employees"][0]["skills"] = [marker]
+    request["planned_calls"][0]["calls_per_hour"] = 12.0
+    request["max_agents"] = 1
+
+    response = client.post("/api/schedule-v2", json=request)
+
+    assert response.status_code == 422
+    assert "max_agents=1" in response.json()["detail"]
+    assert marker not in response.text
+    assert "Traceback" not in response.text
+
+
 def test_solver_preview_validation_errors_remain_fastapi_422():
     response = client.post("/api/solver-preview", json={})
 
