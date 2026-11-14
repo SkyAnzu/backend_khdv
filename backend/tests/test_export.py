@@ -177,6 +177,66 @@ def test_csv_prefixes_dangerous_untrusted_text_but_preserves_plain_values(
     assert rows[1][column] == expected
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        "＝1+1",
+        "＋1+1",
+        "－1+1",
+        "＠SUM(A1:A2)",
+        " ＝1+1",
+        " 　＋1+1",
+    ],
+)
+@pytest.mark.parametrize("field", ["employee_id", "group_id"])
+def test_csv_detects_nfkc_formula_markers_without_normalizing_text(
+    sample_response, value, field
+):
+    assignment = sample_response.schedule.assignments[0]
+    if field == "employee_id":
+        assignment = assignment.model_copy(update={"employee_id": value})
+        column = 0
+    else:
+        first_slot = assignment.groups_by_slot[0].model_copy(
+            update={"group_id": value}
+        )
+        assignment = assignment.model_copy(
+            update={
+                "groups_by_slot": [first_slot, *assignment.groups_by_slot[1:]]
+            }
+        )
+        column = 6
+    schedule = sample_response.schedule.model_copy(
+        update={"assignments": [assignment]}
+    )
+    response = sample_response.model_copy(update={"schedule": schedule})
+
+    rows = csv_rows(pipeline_to_csv(response))
+
+    assert rows[1][column] == "'" + value
+
+
+@pytest.mark.parametrize("field", ["employee_id", "group_id"])
+def test_csv_rejects_unpaired_surrogates_without_echoing_text(sample_response, field):
+    invalid_unicode = chr(0xD800)
+    if field == "employee_id":
+        path = ["schedule", "assignments", 0, "employee_id"]
+    else:
+        path = ["schedule", "assignments", 0, "groups_by_slot", 0, "group_id"]
+    payload = sample_response.model_dump(mode="python")
+    target = payload
+    for key in path[:-1]:
+        target = target[key]
+    target[path[-1]] = invalid_unicode
+    response = PipelineResponse.model_validate(payload)
+    malformed = PipelineResponse.model_construct(**response.__dict__)
+
+    for candidate in (response, malformed):
+        with pytest.raises(ValueError, match="valid Unicode") as error:
+            pipeline_to_csv(candidate)
+        assert invalid_unicode not in str(error.value)
+
+
 @pytest.mark.parametrize("status", ["INFEASIBLE", "UNKNOWN", "MODEL_INVALID"])
 def test_csv_rejects_results_without_a_proven_feasible_schedule(
     sample_response, status

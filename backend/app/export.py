@@ -2,6 +2,7 @@
 
 import csv
 import io
+import unicodedata
 from datetime import date, datetime
 
 from .pipeline import PipelineResponse
@@ -46,17 +47,27 @@ def _time_text(minutes: int) -> str:
 
 
 def _excel_safe(value: str) -> str:
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        raise ValueError("CSV text must contain valid Unicode") from None
+
     index = 0
-    while index < len(value) and (
-        value[index].isspace()
-        or ord(value[index]) < 32
-        or 127 <= ord(value[index]) < 160
-    ):
+    while index < len(value):
+        normalized = unicodedata.normalize("NFKC", value[index])
+        if not (
+            normalized.isspace()
+            or ord(value[index]) < 32
+            or 127 <= ord(value[index]) < 160
+        ):
+            break
         index += 1
     has_leading_control = any(
         ord(char) < 32 or 127 <= ord(char) < 160 for char in value[:index]
     )
-    if has_leading_control or value[index : index + 1] in _FORMULA_MARKERS:
+    # Normalize only for detection; keep the original text in the CSV cell.
+    marker = unicodedata.normalize("NFKC", value[index : index + 1])
+    if has_leading_control or marker in _FORMULA_MARKERS:
         return "'" + value
     return value
 

@@ -12,7 +12,16 @@ Hàm chỉ render response hiện có, không chạy lại solver và không t�
 Chỉ `OPTIMAL`/`FEASIBLE` được xuất; lịch khả thi rỗng tạo CSV có hàng tiêu đề.
 Response sai cấu trúc hoặc vượt giới hạn solver bị từ chối. ID nhân viên và
 tên nhóm có thể được thêm dấu nháy đơn đầu giá trị để giảm nguy cơ formula
-injection; khi đó dữ liệu CSV khác giá trị gốc có chủ ý.
+injection; NFKC chỉ dùng để nhận diện marker full-width sau whitespace/control,
+còn nội dung gốc được giữ nguyên. Text có lone surrogate bị từ chối bằng lỗi
+`ValueError` chung, không đưa lại giá trị input.
+
+[OWASP CSV Injection](https://owasp.org/www-community/attacks/CSV_Injection)
+ghi nhận full-width marker có thể được hiểu là công thức ở một số locale; đồng
+thời các cách escape thông thường có thể mất tác dụng khi Microsoft Excel lưu
+rồi mở lại file. Vì vậy dấu nháy đơn ở đây chỉ giảm rủi ro, không phải bảo đảm
+an toàn với mọi bảng tính/locale. Không có Microsoft Excel hoặc locale cụ thể
+nào được chạy kiểm thử trực tiếp.
 
 Response hiện chỉ cung cấp tổng số phân công lệch kỹ năng/cảnh báo, không chỉ
 ra phân công cụ thể nào lệch. Vì vậy CSV không tự gắn cờ khớp kỹ năng từng dòng.
@@ -22,12 +31,19 @@ không xác minh độc lập độ phủ/ràng buộc hay nguồn gốc của r
 ## Kiểm tra
 
 - `.\.venv\Scripts\python.exe -m pytest backend\tests\test_export.py -q` —
-  **36 passed**.
-- `.\.venv\Scripts\python.exe -m pytest backend\tests -q` — **184 passed**.
+  **50 passed**.
+- `.\.venv\Scripts\python.exe -m pytest -q --ignore=backend/tests/test_import_calls.py`
+  — **198 passed**; đây là kết quả có thể tái lập sau khi chỉ các file export
+  trong commit này được checkout.
+- `.\.venv\Scripts\python.exe -m pytest backend\tests -q` trên working tree
+  hiện tại — **251 passed**, bao gồm **53 test** từ
+  `backend/tests/test_import_calls.py` chưa commit. Con số này bao gồm thay đổi
+  XLSX import đang chờ duyệt, không phải baseline sạch của commit export.
 - `git diff --check` và `git diff --cached --check` — không có lỗi whitespace.
 - Test dùng request pipeline planned-calls tổng hợp, kiểm tra round-trip CSV,
   ngày/giờ, nhiều nhóm trong một ca, CSV formula injection, status solver,
-  response sai cấu trúc và lịch khả thi không có assignment.
+  marker full-width/NBSP, surrogate sai Unicode, response sai cấu trúc và lịch
+  khả thi không có assignment.
 
 ## Tự kiểm thử trên Windows
 
