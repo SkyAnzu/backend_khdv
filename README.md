@@ -199,6 +199,8 @@ lệnh pytest ở phần trên.
 - `POST http://127.0.0.1:8000/api/solver-preview` — solver prototype v1 cũ.
 - `POST http://127.0.0.1:8000/api/schedule-v2` — pipeline API prototype, contract
   tạm thời để thử nghiệm, chưa chốt với frontend.
+- `POST http://127.0.0.1:8000/api/calls/import` — parse body CSV/XLSX thành rows;
+  không chạy pipeline hoặc lưu file.
 - Swagger: `http://127.0.0.1:8000/docs`
 
 Trong Swagger, chọn `POST /api/schedule-v2` → **Try it out** rồi gửi nội dung
@@ -217,13 +219,71 @@ Response trả `mode`, forecast (null ở mode planned), kết quả Erlang theo
 requirements 30 phút và response solver gồm nguyên trạng status, phase status
 và warnings. `INFEASIBLE`, `UNKNOWN` và `MODEL_INVALID` là kết quả HTTP 200 của
 solver; validation và lỗi miền tính toán trả HTTP 422. Request validation của
-endpoint mới không lặp giá trị input trong lỗi; `/api/solver-preview` vẫn giữ
-hành vi cũ. Hàm route là đồng bộ để FastAPI chạy nó trong threadpool; giới hạn
-solver tối đa 30 giây vẫn giữ nguyên.
+`/api/schedule-v2` và `/api/calls/import` không lặp giá trị input trong lỗi;
+`/api/solver-preview` vẫn giữ hành vi cũ. Hàm schedule route là đồng bộ để
+FastAPI chạy nó trong threadpool; giới hạn solver tối đa 30 giây vẫn giữ nguyên.
 
 Response trong file `*-response.json` là mẫu thực đã nhận từ request tổng hợp;
 status và assignment có thể khác nếu solver dừng ở `FEASIBLE`, nhưng schema và
 ý nghĩa status được giữ nguyên.
+
+## Parse calls CSV/XLSX qua API local
+
+`POST /api/calls/import` nhận **raw bytes** làm HTTP body, không phải
+`multipart/form-data`. Chọn rõ `file_format=csv|xlsx` và `mode=history|planned_calls`;
+truyền mỗi nhóm bằng một query `group_id` lặp lại (1–10 nhóm duy nhất). Không
+suy luận format từ tên file, không nhận path và không ghi file. `Content-Type`
+phải khớp format (`text/csv` hoặc MIME XLSX bên dưới); cũng có thể dùng
+`application/octet-stream` vì `file_format` đã được chỉ định. Content-Encoding
+nén không được hỗ trợ.
+
+Ví dụ dùng sample planned calls; response giữ đúng model theo mode và ngày ISO:
+
+```powershell
+curl.exe --request POST "http://127.0.0.1:8000/api/calls/import?file_format=csv&mode=planned_calls&group_id=sales" --header "Content-Type: text/csv" --data-binary "@backend/samples/calls-planned.csv"
+
+Invoke-RestMethod -Method Post -Uri 'http://127.0.0.1:8000/api/calls/import?file_format=csv&mode=planned_calls&group_id=sales' -ContentType "text/csv" -InFile "backend\samples\calls-planned.csv"
+```
+
+Response dự kiến:
+
+```json
+{
+  "mode": "planned_calls",
+  "rows": [
+    {
+      "date": "2026-11-02",
+      "hour": 8,
+      "group_id": "sales",
+      "calls_per_hour": 2.5
+    },
+    {
+      "date": "2026-11-02",
+      "hour": 9,
+      "group_id": "sales",
+      "calls_per_hour": 0.0
+    }
+  ]
+}
+```
+
+Với nhiều nhóm, lặp query, ví dụ
+`...?file_format=csv&mode=history&group_id=sales&group_id=support`. Response
+history dùng `calls` số nguyên; response planned dùng `calls_per_hour` số hữu
+hạn, có thể thập phân. Giá trị zero được giữ nguyên, không tự điền record thiếu.
+Trong Swagger, endpoint ghi body dạng binary; gửi nội dung file trực tiếp thay vì
+form upload. XLSX dùng MIME
+`application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`.
+
+Server stream và chặn body thực lớn hơn 2 MiB (Content-Length chỉ là early reject,
+không thay cho giới hạn stream); các row/XLSX caps vẫn do parser hiện có áp dụng.
+Chỉ một parse chạy đồng thời trong mỗi process; khi bận endpoint trả HTTP 429 và
+`Retry-After: 1`. Đây là guard cục bộ theo process, không phải hàng đợi hay giới
+hạn xuyên nhiều worker. API trả rows để caller ghép vào `history` hoặc
+`planned_calls` của `PipelineRequest`; endpoint không tự tạo request lịch, không
+kiểm tra nhân viên/coverage, không chạy solver và chưa tích hợp frontend. Chỉ
+chạy local với dữ liệu tổng hợp/đã khử định danh; API prototype chưa có auth hoặc
+public deployment.
 
 ## Xuất kết quả pipeline đã có sang CSV
 
@@ -265,14 +325,15 @@ gắn cờ khớp kỹ năng giả cho từng dòng. Chưa có route export riê
 integration. Export từ chối response vượt giới hạn hiện có: tối đa 10.000 ca
 (50 nhân viên × 200 giờ bắt đầu), tương đương 30.000 dòng slot.
 
-## Đọc calls theo giờ từ CSV/XLSX — hàm Python nội bộ
+## Đọc calls theo giờ từ CSV/XLSX — parser Python và API local
 
 `backend.app.import_calls.parse_calls_import(data: bytes, *, file_format,
-mode, group_ids)` nhận bytes trong bộ nhớ và trả về list model pipeline hiện có:
+mode, group_ids)` nhận bytes trong bộ nhớ và trả về list model pipeline hiện có.
+`POST /api/calls/import` bọc parser này với body raw bytes và trả `{mode, rows}`:
 `PipelineHistoryObservation` khi `mode="history"` hoặc `PipelinePlannedCalls`
 khi `mode="planned_calls"`. Không nhận đường dẫn, không ghi file và không tạo
-request HTTP/upload; form web và pipeline JSON hiện tại không đổi. Kết quả parser
-chỉ là các dòng calls, chưa phải một `PipelineRequest` hoàn chỉnh.
+multipart upload; form web và pipeline JSON hiện tại không đổi. Kết quả chỉ là
+các dòng calls, chưa phải một `PipelineRequest` hoàn chỉnh.
 
 CSV và XLSX dùng cùng đúng bốn cột theo thứ tự:
 
@@ -357,8 +418,8 @@ không phải file sample của repo.
 
 Parser kiểm tra kiểu, ngày/giờ, group, số dòng và khóa trùng; quy tắc phủ đủ
 `operating_hours × groups`, tuần đích và các trường nhân viên/ca vẫn do
-`PipelineRequest` hiện có kiểm tra khi caller ghép request sau này. Đây chỉ là
-helper nội bộ; chưa có upload endpoint, UI hoặc tích hợp frontend.
+`PipelineRequest` hiện có kiểm tra khi caller ghép request sau này. Route import
+là API local-only cho rows; chưa có UI/form upload hoặc tích hợp frontend.
 
 Prototype chưa có auth, database, public deployment hoặc contract sản phẩm đã
 chốt. Chỉ chạy trên loopback với sample/dữ liệu đã khử định danh; không đưa
