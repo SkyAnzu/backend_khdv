@@ -15,12 +15,15 @@ README có ví dụ tổng hợp hoàn chỉnh và lệnh chạy trên Windows.
 
 ## Kiểm tra
 
-- `.\.venv\Scripts\python.exe -m pytest backend\tests\test_pipeline.py -q` —
-  **24 passed**.
-- `.\.venv\Scripts\python.exe -m pytest backend\tests -q` — **130 passed**.
+- Chạy lại khi cập nhật report (2026-11-14):
+  `.\.venv\Scripts\python.exe -m pytest backend\tests\test_pipeline.py -q` —
+  **25 passed in 0.42s**.
+- Cùng lần xác minh:
+  `.\.venv\Scripts\python.exe -m pytest backend\tests -q` —
+  **131 passed in 0.65s**.
 - Ví dụ README chạy với dữ liệu tổng hợp; solver trả `OPTIMAL`, nhu cầu 1 người
   cho 0.5 calls/giờ và `service_level=0.9609121154958824`.
-- `git diff --cached --check` — không có lỗi whitespace.
+- `git diff --check` sau khi cập nhật report — không có lỗi whitespace.
 
 ## Giới hạn và tự kiểm thử
 
