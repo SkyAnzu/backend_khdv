@@ -265,6 +265,101 @@ gắn cờ khớp kỹ năng giả cho từng dòng. Chưa có route export riê
 integration. Export từ chối response vượt giới hạn hiện có: tối đa 10.000 ca
 (50 nhân viên × 200 giờ bắt đầu), tương đương 30.000 dòng slot.
 
+## Đọc calls theo giờ từ CSV/XLSX — hàm Python nội bộ
+
+`backend.app.import_calls.parse_calls_import(data: bytes, *, file_format,
+mode, group_ids)` nhận bytes trong bộ nhớ và trả về list model pipeline hiện có:
+`PipelineHistoryObservation` khi `mode="history"` hoặc `PipelinePlannedCalls`
+khi `mode="planned_calls"`. Không nhận đường dẫn, không ghi file và không tạo
+request HTTP/upload; form web và pipeline JSON hiện tại không đổi. Kết quả parser
+chỉ là các dòng calls, chưa phải một `PipelineRequest` hoàn chỉnh.
+
+CSV và XLSX dùng cùng đúng bốn cột theo thứ tự:
+
+```csv
+date,hour,group_id,calls
+2026-11-02,8,sales,2.5
+```
+
+`date` dùng `YYYY-MM-DD` (Excel cũng nhận ô ngày lúc 00:00), `hour` là số nguyên
+0–22; giờ 23 bị từ chối vì solver hiện không hỗ trợ slot 23:30. `group_id` phải
+nằm trong danh sách `group_ids` đã chọn. Với `history`, `calls` là số nguyên
+không âm; với `planned_calls`, đó là số hữu hạn không âm và có thể thập phân
+(dấu chấm thập phân). Số 0 hợp lệ, nhưng parser không tự điền dòng/cột thiếu.
+Dòng trùng theo ngày/giờ/nhóm, header sai, nhóm lạ và giá trị sai bị từ chối;
+lỗi chỉ nêu định dạng và dòng/hàng, không lặp nội dung ô.
+
+Giới hạn: file tối đa 2 MiB, tối đa 10.000 dòng history hoặc 1.610 dòng
+planned calls. XLSX chỉ nhận gói `.xlsx` có một sheet tên `calls`; worksheet
+được tìm qua workbook relationship trong `xl/worksheets/`, target không an toàn
+và worksheet part thừa bị từ chối. Tất cả `.xml`/`.rels` được preflight bằng XML
+streaming trước bất kỳ eager XML parsing nào của `openpyxl`. Từng part tối đa
+2 MiB; tổng XML tối đa 150.000 elements, mỗi eager part 4.096 elements,
+worksheet 120.000 và shared strings 50.000; độ sâu tối đa 64, tối đa 64
+attributes/element và 100.000 attributes tổng. Shared strings còn giới hạn
+20.000 mục/200.000 ký tự và từ chối rich text runs. Manifest phải chọn đúng một
+`xl/workbook.xml`; nếu có shared strings, manifest và relationship phải cùng
+chọn `xl/sharedStrings.xml`. Content types, workbook XML và relationship
+metadata tối đa 1 MiB. Parser cũng từ chối công thức, macro, external links, ZIP
+mã hóa/entry nguy hiểm, hơn 100 entry, tổng giải nén theo metadata hơn 20 MiB,
+một entry hơn 10 MiB hoặc tỷ lệ nén trên 100. `openpyxl` 3.1.5 đọc workbook
+read-only, không lấy cached formula result; `defusedxml` 0.7.1 bật bảo vệ XML.
+XLSX test được tạo trong bộ nhớ, không thực thi công thức.
+
+Trước `iterparse`, byte guard yêu cầu UTF-8 (cho phép BOM đầu part, từ chối NUL
+và XML declaration encoding khác UTF-8), tối đa 256 literal `xmlns` markers mỗi
+part và tối đa 8 KiB cho mỗi markup token được quét quote-aware (tag, comment,
+CDATA hoặc PI). Marker được đếm thô trên bytes, kể cả trong comment/text, nên có
+thể từ chối nhầm part không khai báo namespace. Đây là guard allocation có phạm
+vi hẹp, không phải XML validator hay cam kết mọi XML độc hại đều bị chặn; DTD,
+entity và external entity vẫn bị `defusedxml` cấm. Giới hạn 2 MiB/part và sức
+chứa worksheet thông thường không đổi.
+
+Giới hạn ZIP: parser kiểm tra `ZipInfo` và số byte `zipfile` trả về, nhưng
+không tự giải mã/đếm độc lập toàn bộ raw DEFLATE stream khi metadata khai báo
+sai kích thước. Kiểm tra source Python 3.12 cho thấy
+`zipfile.ZipExtFile._read1` cắt output theo `ZipInfo.file_size` và dừng khi đạt
+giới hạn khai báo; vì vậy output parser nhận được còn bị chặn bởi các size caps.
+Đây là bằng chứng cho giới hạn output trả về, không phải xác minh kích thước
+thực/EOF của raw stream; metadata discrepancy vẫn là giới hạn integrity còn lại.
+
+Hai CSV tổng hợp có sẵn: `backend/samples/calls-history.csv` và
+`backend/samples/calls-planned.csv`. Ví dụ đọc sample bằng helper:
+
+```python
+from pathlib import Path
+
+from backend.app.import_calls import parse_calls_import
+
+history = parse_calls_import(
+    Path("backend/samples/calls-history.csv").read_bytes(),
+    file_format="csv",
+    mode="history",
+    group_ids=["sales"],
+)
+planned = parse_calls_import(
+    Path("backend/samples/calls-planned.csv").read_bytes(),
+    file_format="csv",
+    mode="planned_calls",
+    group_ids=["sales"],
+)
+excel = parse_calls_import(
+    Path("du_lieu.xlsx").read_bytes(),
+    file_format="xlsx",
+    mode="planned_calls",
+    group_ids=["sales"],
+)
+```
+
+Ở ví dụ XLSX, file do người gọi đọc thành bytes; bên trong phải có đúng một sheet
+`calls` với cùng header. `du_lieu.xlsx` là tên file do người dùng tự cung cấp,
+không phải file sample của repo.
+
+Parser kiểm tra kiểu, ngày/giờ, group, số dòng và khóa trùng; quy tắc phủ đủ
+`operating_hours × groups`, tuần đích và các trường nhân viên/ca vẫn do
+`PipelineRequest` hiện có kiểm tra khi caller ghép request sau này. Đây chỉ là
+helper nội bộ; chưa có upload endpoint, UI hoặc tích hợp frontend.
+
 Prototype chưa có auth, database, public deployment hoặc contract sản phẩm đã
 chốt. Chỉ chạy trên loopback với sample/dữ liệu đã khử định danh; không đưa
 secret vào repo và không chạy tunnel với dữ liệu thật.
