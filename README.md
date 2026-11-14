@@ -42,6 +42,71 @@ Module nội bộ nhận số calls/giờ, AHT và mục tiêu SLA; không có r
 Mặc định phép tìm kiếm bị giới hạn ở 10.000 nhân viên để chặn công việc quá lớn;
 không đạt target trong giới hạn sẽ ném `ValueError`, không phải trạng thái solver.
 
+## Pipeline nội bộ: forecast/Erlang C → solver tuần v2
+
+`backend.app.pipeline.run_pipeline(PipelineRequest)` ghép hai nguồn nhu cầu với
+Erlang C và `solve_schedule_v2()`. Đây là interface Python nội bộ, không phải
+route/API; `/api/solver-preview` không đổi. AHT và ngưỡng chờ tính bằng giây,
+SLA là tỷ lệ từ 0 đến 1; các tham số Erlang C dùng chung cho mọi nhóm trong
+request. Kết quả `service_level` là ước lượng Erlang C theo nhóm, không phải cam
+kết SLA cho pool nhân viên đa kỹ năng.
+
+Ví dụ tổng hợp, đầy đủ ma trận theo giờ/nhóm và hai slot nửa giờ:
+
+```python
+import json
+
+from backend.app.pipeline import PipelineRequest, run_pipeline
+
+day = "2026-11-02"
+half_hours = ("08:00", "08:30", "09:00", "09:30")
+payload = {
+    "mode": "planned_calls",
+    "week_start": day,
+    "groups": ["sales"],
+    "operating_hours": [
+        {"date": day, "hour": 8},
+        {"date": day, "hour": 9},
+    ],
+    "planned_calls": [
+        {"date": day, "hour": 8, "group_id": "sales", "calls_per_hour": 0.5},
+        {"date": day, "hour": 9, "group_id": "sales", "calls_per_hour": 0},
+    ],
+    "aht_seconds": 300,
+    "target_sla": 0.8,
+    "waiting_seconds": 20,
+    "employees": [{
+        "id": "e01",
+        "skills": ["sales"],
+        "available_slots": [
+            {"date": day, "start": start} for start in half_hours
+        ],
+        "unavailable_dates": [],
+        "max_work_minutes_per_week": 90,
+    }],
+    "shift_starts": [{"date": day, "start": "08:00"}],
+}
+result = run_pipeline(PipelineRequest.model_validate(payload))
+print(json.dumps(result.model_dump(mode="json"), ensure_ascii=True))
+```
+
+Để chạy nhánh lịch sử, đặt `mode` thành `"history"`, bỏ `planned_calls` và thêm
+ít nhất hai quan sát trước tuần đích cho cùng weekday/giờ/nhóm của mọi ô vận
+hành. Dùng `PipelineRequest.model_validate(payload)` cho cả hai mode; không được
+đưa cả hai nguồn cùng lúc. Calls dự kiến phải khai báo đúng một dòng cho mỗi
+`operating_hours × groups`, kể cả zero. Mỗi nhu cầu Erlang C được giữ nguyên ở
+hai slot 30 phút tương ứng. Operating hours phải liên tục trong từng ngày; giờ
+23 bị từ chối rõ ràng vì slot 23:30 không được solver v2 hỗ trợ. Nhân viên,
+availability, ngày vắng, giới hạn phút và giờ bắt đầu ca dùng model solver v2
+hiện có; giờ/ca không nằm trong operating grid bị từ chối.
+
+Erlang C mặc định tìm tối đa 10.000 agents; khi kết quả vượt giới hạn 50 người
+cho mỗi nhóm/slot của solver v2, pipeline ném `ValueError` thay vì kẹp số hoặc
+trả `INFEASIBLE`. Lỗi không đủ `max_agents` cũng là `ValueError`. Kết quả gồm
+forecast (chỉ mode history), calls và service level theo giờ, requirements từng
+slot, cùng response solver nguyên trạng gồm status, `stage_two_status` và
+warnings. Kiểm tra cả pipeline bằng pytest ở mục cài đặt.
+
 ## Solver tuần v2 (module Python nội bộ)
 
 `backend.app.solver_v2.solve_schedule_v2()` là module mới, độc lập với solver
@@ -116,8 +181,8 @@ tách riêng khỏi `INFEASIBLE`.
 
 Giới hạn cứng để chặn model quá lớn: 50 nhân viên, 10 nhóm, 336 operating slots,
 200 ca bắt đầu, 3.360 dòng nhu cầu và tối đa 30 giây solve. Không hỗ trợ nghỉ
-giữa ca, ca qua ngày, múi giờ/DST hoặc tích hợp forecast/Erlang C/API. Chạy test
-v2 cùng toàn bộ backend bằng lệnh pytest ở phần trên.
+giữa ca, ca qua ngày, múi giờ/DST hoặc route/API cho pipeline. Chạy test v2 cùng
+toàn bộ backend bằng lệnh pytest ở phần trên.
 
 ## Chạy API local
 
