@@ -225,6 +225,46 @@ Response trong file `*-response.json` là mẫu thực đã nhận từ request 
 status và assignment có thể khác nếu solver dừng ở `FEASIBLE`, nhưng schema và
 ý nghĩa status được giữ nguyên.
 
+## Xuất kết quả pipeline đã có sang CSV
+
+`backend.app.export.pipeline_to_csv(result)` tạo bytes CSV từ các assignment
+đang có trong `PipelineResponse`; hàm này không gọi lại pipeline hoặc solver và
+không xác minh độc lập độ phủ, ràng buộc hay nguồn gốc của response. Chỉ dùng
+với kết quả đáng tin cậy do pipeline vừa trả về. Ví dụ dùng request tổng hợp đã
+có trong repo và ghi file có chủ ý tại thư mục hiện hành:
+
+```python
+import json
+from pathlib import Path
+
+from backend.app.export import pipeline_to_csv
+from backend.app.pipeline import PipelineRequest, run_pipeline
+
+payload = json.loads(
+    Path("backend/samples/pipeline-planned-calls-request.json").read_text(
+        encoding="utf-8"
+    )
+)
+result = run_pipeline(PipelineRequest.model_validate(payload))
+Path("lich_mau.csv").write_bytes(pipeline_to_csv(result))
+```
+
+Mỗi dòng là một phân công nhân viên/nhóm trong một slot 30 phút; thông tin ca
+90 phút được lặp lại ở ba dòng. `Bắt đầu khoảng` và `Kết thúc khoảng` là biên
+của slot, còn `Bắt đầu ca` và `Kết thúc ca` là biên của cả ca. Ngày dùng
+`YYYY-MM-DD`, giờ dùng `HH:MM`. File có BOM UTF-8 và được tạo bằng `csv.writer`
+để Excel đọc tiếng Việt và giữ nguyên dấu phẩy/nháy/xuống dòng trong ô.
+
+Chỉ `OPTIMAL` hoặc `FEASIBLE` được xuất; status không có lịch hợp lệ bị từ chối.
+Lịch khả thi không có phân công vẫn cho file chỉ có hàng tiêu đề. Mã nhân viên
+và tên nhóm bắt đầu bằng `=`, `+`, `-`, `@`, hoặc bằng control/whitespace nguy
+cơ được thêm dấu nháy đơn ở đầu để giảm nguy cơ formula injection; giá trị CSV
+có thể hiển thị thêm dấu này. Response solver chỉ có số lần lệch kỹ
+năng/cảnh báo ở mức tổng hợp, không chỉ rõ phân công nào lệch, nên CSV không
+gắn cờ khớp kỹ năng giả cho từng dòng. Chưa có route export riêng hoặc frontend
+integration. Export từ chối response vượt giới hạn hiện có: tối đa 10.000 ca
+(50 nhân viên × 200 giờ bắt đầu), tương đương 30.000 dòng slot.
+
 Prototype chưa có auth, database, public deployment hoặc contract sản phẩm đã
 chốt. Chỉ chạy trên loopback với sample/dữ liệu đã khử định danh; không đưa
 secret vào repo và không chạy tunnel với dữ liệu thật.
