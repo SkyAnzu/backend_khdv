@@ -278,9 +278,30 @@ def run_pipeline(request: PipelineRequest) -> PipelineResponse:
             for item in request.operating_hours
             for group in request.groups
         ]
-        forecast = forecast_calls(
-            ForecastRequest(history=request.history, targets=targets)
-        )
+        try:
+            forecast_request = ForecastRequest(history=request.history, targets=targets)
+        except ValidationError as error:
+            errors = error.errors(include_input=False, include_context=False)
+            if (
+                error.title == "ForecastRequest"
+                and len(errors) == 1
+                and errors[0]["type"] == "value_error"
+                and errors[0]["loc"] == ()
+                and errors[0]["msg"]
+                == (
+                    "Value error, each target needs at least two prior "
+                    "same weekday/hour/group samples"
+                )
+            ):
+                raise PipelineDomainError(
+                    "history lacks enough matching samples for forecast targets",
+                    public_message=(
+                        "History has insufficient prior samples for one or more "
+                        "targets."
+                    ),
+                ) from None
+            raise
+        forecast = forecast_calls(forecast_request)
         hourly_calls = [
             (
                 item.date,

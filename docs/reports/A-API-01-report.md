@@ -19,14 +19,15 @@ deployment đã chốt.
 ## Kiểm tra
 
 - `.\.venv\Scripts\python.exe -m pytest backend\tests\test_api.py -q` —
-  **18 passed**.
-- `.\.venv\Scripts\python.exe -m pytest backend\tests -q` — **147 passed**.
+  **19 passed**.
+- `.\.venv\Scripts\python.exe -m pytest backend\tests -q` — **148 passed**.
 - `git diff --cached --check` — không có lỗi whitespace.
 - TestClient xác nhận hai mode, zero demand, `INFEASIBLE`, passthrough cả status
   còn lại, validation/domain error 422 và tương thích validation của route cũ.
 - Regression kiểm tra lỗi `ForecastRequest` thiếu mẫu trả 422 với thông báo an
   toàn phân biệt được thiếu mẫu, không lộ dữ liệu đầu vào; lỗi Erlang C giữ
-  ngữ cảnh giới hạn an toàn nhưng không phản hồi group id.
+  ngữ cảnh giới hạn an toàn nhưng không phản hồi group id. Lỗi validation ở
+  response nội bộ trả 500, không bị đổi thành lỗi request 422.
 - Live loopback smoke: `GET /health` trả `ok`; hai POST bằng
   `Invoke-RestMethod -Method Post -ContentType application/json -InFile`
   trả `OPTIMAL`; planned sample trả 0.5 calls/giờ và một assignment, history

@@ -5,7 +5,7 @@ import pytest
 from pydantic import ValidationError
 
 from backend.app import pipeline
-from backend.app.pipeline import PipelineRequest, run_pipeline
+from backend.app.pipeline import PipelineDomainError, PipelineRequest, run_pipeline
 from backend.app.solver_v2 import SolverV2Response
 
 
@@ -206,7 +206,7 @@ def test_operating_grid_rejects_unsupported_or_malformed_hours(change, message):
         PipelineRequest.model_validate(invalid)
 
 
-def test_history_without_matching_target_group_fails_forecast_validation():
+def test_history_without_matching_target_group_fails_with_safe_domain_error():
     request_payload = payload(mode="history")
     del request_payload["planned_calls"]
     request_payload["history"] = [
@@ -215,8 +215,11 @@ def test_history_without_matching_target_group_fails_forecast_validation():
         for hour in (8, 9)
     ]
 
-    with pytest.raises(ValidationError, match="two prior same weekday/hour/group"):
+    with pytest.raises(PipelineDomainError) as error:
         run_pipeline(PipelineRequest.model_validate(request_payload))
+    assert error.value.public_message == (
+        "History has insufficient prior samples for one or more targets."
+    )
 
 
 def test_history_inside_scheduling_week_is_rejected_to_prevent_leakage():

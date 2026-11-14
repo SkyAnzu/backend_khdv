@@ -211,6 +211,24 @@ def test_schedule_v2_preserves_solver_status_phase_and_warnings(
     assert schedule["message"] == "synthetic solver status"
 
 
+def test_schedule_v2_internal_response_validation_error_returns_500(monkeypatch):
+    marker = "PRIVATE-MARKER-output-validation"
+    request = load_sample("pipeline-planned-calls-request.json")
+    request["groups"] = [marker]
+    request["planned_calls"] = [
+        {**item, "group_id": marker} for item in request["planned_calls"]
+    ]
+    request["employees"][0]["skills"] = [marker]
+    monkeypatch.setattr(pipeline, "solve_schedule_v2", lambda request: None)
+
+    response = TestClient(app, raise_server_exceptions=False).post(
+        "/api/schedule-v2", json=request
+    )
+
+    assert response.status_code == 500
+    assert marker not in response.text
+
+
 def test_schedule_v2_returns_domain_errors_as_422_without_traceback():
     request = load_sample("pipeline-planned-calls-request.json")
     request["planned_calls"][0]["calls_per_hour"] = 12.0
