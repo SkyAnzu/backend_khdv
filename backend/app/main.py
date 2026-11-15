@@ -3,9 +3,11 @@ import threading
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
+from pydantic import ValidationError
 from starlette.concurrency import run_in_threadpool
 
+from .export import pipeline_to_csv
 from .import_calls import (
     MAX_FILE_BYTES,
     CallImportError,
@@ -31,8 +33,9 @@ app = FastAPI(
     description=(
         "API local prototype. /api/solver-preview giữ solver v1; "
         "/api/schedule-v2 là endpoint thử nghiệm pipeline, chưa phải contract "
-        "sản phẩm đã chốt. /api/calls/import chỉ parse rows CSV/XLSX, không chạy "
-        "pipeline hoặc lưu file."
+        "sản phẩm đã chốt. /api/schedule-v2/export chỉ render CSV từ response "
+        "caller gửi, không chạy pipeline/solver hay xác minh lịch. "
+        "/api/calls/import chỉ parse rows CSV/XLSX, không chạy pipeline hoặc lưu file."
     ),
 )
 
@@ -83,7 +86,7 @@ def _validate_import_headers(request: Request, file_format: CallImportFormat) ->
         )
 
 
-async def _read_bounded_import_body(request: Request) -> bytes:
+async def _read_bounded_body(request: Request, *, body_name: str) -> bytes:
     declared_length = request.headers.get("content-length")
     if declared_length is not None:
         try:
@@ -93,7 +96,7 @@ async def _read_bounded_import_body(request: Request) -> bytes:
         if declared_size > MAX_FILE_BYTES:
             raise HTTPException(
                 status_code=413,
-                detail="Import file exceeds the 2 MiB size limit.",
+                detail=f"{body_name} exceeds the 2 MiB size limit.",
             )
 
     content = bytearray()
@@ -101,10 +104,25 @@ async def _read_bounded_import_body(request: Request) -> bytes:
         if len(chunk) > MAX_FILE_BYTES - len(content):
             raise HTTPException(
                 status_code=413,
-                detail="Import file exceeds the 2 MiB size limit.",
+                detail=f"{body_name} exceeds the 2 MiB size limit.",
             )
         content.extend(chunk)
     return bytes(content)
+
+
+def _validate_export_headers(request: Request) -> None:
+    content_type = (
+        request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    )
+    if content_type != "application/json":
+        raise HTTPException(status_code=415, detail="Unsupported export media type.")
+
+    content_encoding = request.headers.get("content-encoding", "").strip().lower()
+    if content_encoding not in ("", "identity"):
+        raise HTTPException(
+            status_code=415,
+            detail="Compressed request bodies are not supported.",
+        )
 
 
 @app.exception_handler(RequestValidationError)
@@ -186,7 +204,7 @@ async def import_calls_route(
 ) -> dict[str, object]:
     """Parse bounded CSV/XLSX bytes into existing pipeline row models."""
     _validate_import_headers(request, file_format)
-    data = await _read_bounded_import_body(request)
+    data = await _read_bounded_body(request, body_name="Import file")
     try:
         records = await run_in_threadpool(
             _parse_calls_with_limit,
@@ -208,3 +226,57 @@ async def import_calls_route(
         "mode": mode,
         "rows": [record.model_dump(mode="json") for record in records],
     }
+
+
+@app.post(
+    "/api/schedule-v2/export",
+    summary="Export an existing schedule response as CSV",
+    description=(
+        "Local prototype endpoint. Send a PipelineResponse as JSON. It renders "
+        "the caller-provided schedule without rerunning the pipeline or solver "
+        "and does not independently verify its provenance, coverage, or constraints."
+    ),
+    response_class=Response,
+    responses={
+        200: {
+            "description": "UTF-8 CSV attachment.",
+            "content": {
+                "text/csv": {"schema": {"type": "string", "format": "binary"}}
+            },
+        }
+    },
+    openapi_extra={
+        "requestBody": {
+            "required": True,
+            "description": "A PipelineResponse JSON object from an existing result.",
+            "content": {
+                "application/json": {
+                    "schema": {"$ref": "#/components/schemas/PipelineResponse"}
+                }
+            },
+        }
+    },
+)
+async def export_schedule(request: Request) -> Response:
+    """Render a bounded caller-provided pipeline response as a CSV attachment."""
+    _validate_export_headers(request)
+    data = await _read_bounded_body(request, body_name="Export response")
+    try:
+        result = await run_in_threadpool(PipelineResponse.model_validate_json, data)
+    except ValidationError:
+        raise HTTPException(
+            status_code=422, detail="Invalid pipeline response."
+        ) from None
+
+    try:
+        content = await run_in_threadpool(pipeline_to_csv, result)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from None
+
+    return Response(
+        content=content,
+        media_type="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition": 'attachment; filename="lich-lam-viec.csv"'
+        },
+    )

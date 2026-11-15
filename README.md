@@ -199,6 +199,8 @@ lệnh pytest ở phần trên.
 - `POST http://127.0.0.1:8000/api/solver-preview` — solver prototype v1 cũ.
 - `POST http://127.0.0.1:8000/api/schedule-v2` — pipeline API prototype, contract
   tạm thời để thử nghiệm, chưa chốt với frontend.
+- `POST http://127.0.0.1:8000/api/schedule-v2/export` — render `PipelineResponse`
+  hiện có thành CSV, không chạy lại pipeline/solver.
 - `POST http://127.0.0.1:8000/api/calls/import` — parse body CSV/XLSX thành rows;
   không chạy pipeline hoặc lưu file.
 - Swagger: `http://127.0.0.1:8000/docs`
@@ -321,9 +323,30 @@ và tên nhóm bắt đầu bằng `=`, `+`, `-`, `@`, hoặc bằng control/whi
 cơ được thêm dấu nháy đơn ở đầu để giảm nguy cơ formula injection; giá trị CSV
 có thể hiển thị thêm dấu này. Response solver chỉ có số lần lệch kỹ
 năng/cảnh báo ở mức tổng hợp, không chỉ rõ phân công nào lệch, nên CSV không
-gắn cờ khớp kỹ năng giả cho từng dòng. Chưa có route export riêng hoặc frontend
+gắn cờ khớp kỹ năng giả cho từng dòng. Route export không có frontend
 integration. Export từ chối response vượt giới hạn hiện có: tối đa 10.000 ca
 (50 nhân viên × 200 giờ bắt đầu), tương đương 30.000 dòng slot.
+
+`POST /api/schedule-v2/export` nhận JSON là `PipelineResponse` đầy đủ và gọi đúng
+helper này trên response caller gửi; endpoint không gọi `run_pipeline()`/solver.
+Response là CSV bytes với `Content-Type: text/csv; charset=utf-8`,
+`Content-Disposition: attachment; filename="lich-lam-viec.csv"` và BOM UTF-8.
+Body JSON được stream với giới hạn thực tế 2 MiB; chỉ chấp nhận
+`application/json` và không nhận `Content-Encoding` nén. Input sai hoặc status
+không có lịch khả thi trả HTTP 422 an toàn; lỗi lập trình bất ngờ vẫn là HTTP 500.
+
+Ví dụ PowerShell chạy pipeline một lần, rồi gửi lại chính response đó để tải CSV:
+
+```powershell
+$result = Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/api/schedule-v2 -ContentType "application/json" -InFile "backend\samples\pipeline-planned-calls-request.json"
+$body = ConvertTo-Json -InputObject $result -Depth 100 -Compress
+Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/api/schedule-v2/export -ContentType "application/json" -Body $body -OutFile "lich-lam-viec.csv"
+```
+
+Endpoint chỉ render response được gửi lên; không xác minh provenance hoặc tự
+chứng nhận coverage/ràng buộc. Không coi response giả mạo là lịch solver hợp lệ.
+Đây là prototype local chưa có auth, không phải product contract hay frontend
+integration.
 
 ## Đọc calls theo giờ từ CSV/XLSX — parser Python và API local
 
