@@ -1,6 +1,7 @@
 """Hourly Erlang C staffing estimate."""
 
 import math
+from decimal import Decimal, localcontext
 
 from .models import ErlangCRequest, ErlangCResponse, MAX_ERLANG_C_AGENTS
 
@@ -14,38 +15,48 @@ def calculate_required_staff(request: ErlangCRequest) -> ErlangCResponse:
     if not math.isfinite(offered_load):
         raise ValueError("offered load must be finite")
 
-    first_stable_count = math.floor(offered_load) + 1
+    with localcontext() as context:
+        context.prec = 60
+        load = (
+            Decimal(str(request.calls_per_hour))
+            * Decimal(str(request.aht_seconds))
+            / Decimal(3600)
+        )
+        target_sla = Decimal(str(request.target_sla))
+        aht_seconds = Decimal(str(request.aht_seconds))
+        waiting_seconds = Decimal(str(request.waiting_seconds))
+
+    first_stable_count = int(load) + 1
     if first_stable_count > request.max_agents:
         raise ValueError(
             f"offered load requires at least {first_stable_count} agents, "
             f"exceeding max_agents={request.max_agents}"
         )
 
-    erlang_b = 1.0
-    for agents in range(1, request.max_agents + 1):
-        load_times_blocking = offered_load * erlang_b
-        erlang_b = load_times_blocking / (agents + load_times_blocking)
-        if agents < first_stable_count:
-            continue
+    with localcontext() as context:
+        # Inputs are binary floats; str() uses their shortest round-trip decimal.
+        # Decimal arithmetic avoids losing the SLA boundary to 1 - target_sla.
+        context.prec = 60
+        erlang_b = Decimal(1)
+        for agents in range(1, request.max_agents + 1):
+            load_times_blocking = load * erlang_b
+            erlang_b = load_times_blocking / (agents + load_times_blocking)
+            if agents < first_stable_count:
+                continue
 
-        # This is Erlang C rewritten to avoid subtracting offered_load/agents
-        # from one when agents is only slightly above the offered load.
-        probability_wait = (agents * erlang_b) / (
-            agents - offered_load + offered_load * erlang_b
-        )
-        wait_exponent = (
-            -(agents - offered_load)
-            * request.waiting_seconds
-            / request.aht_seconds
-        )
-        wait_factor = math.exp(wait_exponent)
-        missed_probability = probability_wait * wait_factor
-        service_level = 1 - missed_probability
-        if missed_probability <= 1 - request.target_sla:
-            return ErlangCResponse(
-                required_staff=agents,
-                service_level=service_level,
+            # Erlang C form avoids subtracting offered_load/agents near stability.
+            probability_wait = (agents * erlang_b) / (
+                agents - load + load * erlang_b
             )
+            wait_exponent = (
+                -(agents - load) * waiting_seconds / aht_seconds
+            )
+            missed_probability = probability_wait * wait_exponent.exp()
+            if missed_probability <= Decimal(1) - target_sla:
+                return ErlangCResponse(
+                    required_staff=agents,
+                    service_level=float(Decimal(1) - missed_probability),
+                )
 
     raise ValueError(
         f"target SLA not met within max_agents={request.max_agents} "

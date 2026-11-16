@@ -1,4 +1,6 @@
 import math
+from decimal import Decimal, localcontext
+from fractions import Fraction
 from math import factorial
 
 import pytest
@@ -45,6 +47,34 @@ def reference_service_level(
     return 1 - probability_wait * math.exp(
         -(agents - load) * waiting_seconds / aht_seconds
     )
+
+
+def decimal_reference_service_level(
+    calls_per_hour: float,
+    aht_seconds: float,
+    waiting_seconds: float,
+    agents: int,
+) -> Decimal:
+    """High-precision factorial reference, independent of Erlang B recursion."""
+    with localcontext() as context:
+        context.prec = 80
+        load = (
+            Decimal(str(calls_per_hour))
+            * Decimal(str(aht_seconds))
+            / Decimal(3600)
+        )
+        aht = Decimal(str(aht_seconds))
+        waiting = Decimal(str(waiting_seconds))
+        wait_term = load**agents / (
+            factorial(agents) * (1 - load / agents)
+        )
+        normalization = sum(
+            load**k / factorial(k) for k in range(agents)
+        ) + wait_term
+        probability_wait = wait_term / normalization
+        return 1 - probability_wait * (
+            -(agents - load) * waiting / aht
+        ).exp()
 
 
 @pytest.mark.parametrize(
@@ -127,6 +157,70 @@ def test_target_equal_to_calculated_sla_is_inclusive_but_next_float_is_not():
     assert baseline.service_level == 0.5
     assert at_boundary.required_staff == baseline.required_staff
     assert just_above.required_staff > baseline.required_staff
+
+
+@pytest.mark.parametrize(
+    ("target", "expected_staff"),
+    [
+        (math.nextafter(0.8, 0.0), 1),
+        (0.8, 1),
+        (math.nextafter(0.8, 1.0), 2),
+    ],
+)
+def test_decimal_sla_boundary_and_adjacent_floats(target, expected_staff):
+    reference = decimal_reference_service_level(12, 60, 0, 1)
+    decimal_target = Decimal(str(target))
+    exact_load = Fraction(12 * 60, 3600)
+    assert exact_load == Fraction(1, 5)
+    assert (1 - exact_load >= Fraction(str(target))) == (expected_staff == 1)
+    assert (reference >= decimal_target) == (expected_staff == 1)
+    if expected_staff == 2:
+        assert decimal_reference_service_level(12, 60, 0, 2) >= decimal_target
+
+    result = calculate_required_staff(
+        request(
+            calls_per_hour=12,
+            aht_seconds=60,
+            target_sla=target,
+            waiting_seconds=0,
+        )
+    )
+
+    assert result.required_staff == expected_staff
+
+
+@pytest.mark.parametrize(
+    ("calls", "aht", "waiting", "target", "expected_staff"),
+    [
+        (0.5, 3600, 259_000, math.nextafter(1.0, 0.0), 2),
+        (1e-300, 3600, 0, math.nextafter(1.0, 0.0), 1),
+        (0.5, 3600, 1_000_000, math.nextafter(1.0, 0.0), 1),
+    ],
+)
+def test_near_one_threshold_edges_match_decimal_reference(
+    calls, aht, waiting, target, expected_staff
+):
+    decimal_target = Decimal(str(target))
+    assert (
+        decimal_reference_service_level(calls, aht, waiting, expected_staff)
+        >= decimal_target
+    )
+    if expected_staff > 1:
+        assert (
+            decimal_reference_service_level(calls, aht, waiting, expected_staff - 1)
+            < decimal_target
+        )
+
+    result = calculate_required_staff(
+        request(
+            calls_per_hour=calls,
+            aht_seconds=aht,
+            target_sla=target,
+            waiting_seconds=waiting,
+        )
+    )
+
+    assert result.required_staff == expected_staff
 
 
 def test_rounding_near_one_does_not_accept_a_missed_target():

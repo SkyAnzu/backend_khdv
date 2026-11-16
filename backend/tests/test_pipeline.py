@@ -105,6 +105,27 @@ def test_planned_calls_run_through_erlang_and_duplicate_hourly_need_to_two_slots
     ]
 
 
+def test_erlang_decimal_boundary_keeps_one_employee_schedule_feasible():
+    request_payload = payload(
+        volumes={8: 12, 9: 0},
+        employees=[employee("e1")],
+    )
+    request_payload["aht_seconds"] = 60
+    request_payload["target_sla"] = 0.8
+    request_payload["waiting_seconds"] = 0
+
+    result = run_pipeline(PipelineRequest.model_validate(request_payload))
+
+    assert result.hourly_results[0].erlang.required_staff == 1
+    assert result.hourly_results[0].erlang.service_level == 0.8
+    assert result.requirements[0].required_staff == 1
+    assert result.requirements[1].required_staff == 1
+    assert result.schedule.status in {"OPTIMAL", "FEASIBLE"}
+    assert len(result.schedule.assignments) == 1
+    assert result.schedule.assignments[0].start == "08:00"
+    assert len(result.schedule.assignments[0].groups_by_slot) == 3
+
+
 def test_history_mode_preserves_fractional_forecast_and_sample_count_without_leakage():
     request_payload = payload(mode="history")
     del request_payload["planned_calls"]
