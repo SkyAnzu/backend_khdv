@@ -138,6 +138,81 @@ class EmployeeV2(_StrictModel):
         return values
 
 
+def validate_solver_configuration(
+    week_start: date,
+    groups: list[str],
+    operating_slots: list[OperatingSlot],
+    employees: list[EmployeeV2],
+    shift_starts: list[ShiftStart],
+) -> tuple[set[date], set[str], set[tuple[date, str]]]:
+    if week_start.weekday() != 0:
+        raise ValueError("week_start must be a Monday")
+    try:
+        week_dates = set(_week_dates(week_start))
+    except OverflowError as error:
+        raise ValueError("declared week exceeds the supported date range") from error
+    group_set = set(groups)
+    if len(group_set) != len(groups):
+        raise ValueError("group ids must be unique")
+
+    slot_keys = [(slot.date, slot.start) for slot in operating_slots]
+    if len(slot_keys) != len(set(slot_keys)):
+        raise ValueError("operating slots must be unique")
+    if any(day not in week_dates for day, _ in slot_keys):
+        raise ValueError("operating slots must be within the declared week")
+    operating_slot_set = set(slot_keys)
+
+    employee_ids = [employee.id for employee in employees]
+    if len(employee_ids) != len(set(employee_ids)):
+        raise ValueError("employee ids must be unique")
+    for employee in employees:
+        if len(employee.skills) != len(set(employee.skills)):
+            raise ValueError(f"skills for employee {employee.id} must be unique")
+        if not set(employee.skills) <= group_set:
+            raise ValueError(
+                f"skills for employee {employee.id} must use declared groups"
+            )
+        availability = [(slot.date, slot.start) for slot in employee.available_slots]
+        if len(availability) != len(set(availability)):
+            raise ValueError(
+                f"available slots for employee {employee.id} must be unique"
+            )
+        if not set(availability) <= operating_slot_set:
+            raise ValueError(
+                f"available slots for employee {employee.id} must be operating slots"
+            )
+        unavailable = employee.unavailable_dates
+        if len(unavailable) != len(set(unavailable)):
+            raise ValueError(
+                f"unavailable dates for employee {employee.id} must be unique"
+            )
+        if any(day not in week_dates for day in unavailable):
+            raise ValueError(
+                f"unavailable dates for employee {employee.id} must be within the week"
+            )
+        unavailable_set = set(unavailable)
+        if any(day in unavailable_set for day, _ in availability):
+            raise ValueError(
+                f"employee {employee.id} cannot be available on an unavailable date"
+            )
+
+    shift_keys = [(shift.date, shift.start) for shift in shift_starts]
+    if len(shift_keys) != len(set(shift_keys)):
+        raise ValueError("shift starts must be unique")
+    for day, start in shift_keys:
+        if day not in week_dates:
+            raise ValueError("shift starts must be within the declared week")
+        start_minute = _minutes(start)
+        if start_minute > 22 * 60:
+            raise ValueError("90-minute shifts must end on the same day")
+        if any(
+            (day, _time_text(start_minute + offset)) not in operating_slot_set
+            for offset in (0, 30, 60)
+        ):
+            raise ValueError("each shift must contain three operating slots")
+    return week_dates, group_set, operating_slot_set
+
+
 class SlotRequirement(_StrictModel):
     date: date
     start: StrictStr
@@ -186,22 +261,13 @@ class SolverV2Request(_StrictModel):
 
     @model_validator(mode="after")
     def schedule_inputs_are_consistent(self) -> "SolverV2Request":
-        if self.week_start.weekday() != 0:
-            raise ValueError("week_start must be a Monday")
-        try:
-            week_dates = set(_week_dates(self.week_start))
-        except OverflowError as error:
-            raise ValueError("declared week exceeds the supported date range") from error
-        groups = set(self.groups)
-        if len(groups) != len(self.groups):
-            raise ValueError("group ids must be unique")
-
-        slot_keys = [(slot.date, slot.start) for slot in self.operating_slots]
-        if len(slot_keys) != len(set(slot_keys)):
-            raise ValueError("operating slots must be unique")
-        if any(day not in week_dates for day, _ in slot_keys):
-            raise ValueError("operating slots must be within the declared week")
-        operating_slots = set(slot_keys)
+        week_dates, groups, operating_slots = validate_solver_configuration(
+            self.week_start,
+            self.groups,
+            self.operating_slots,
+            self.employees,
+            self.shift_starts,
+        )
 
         requirement_keys = [
             (item.date, item.start, item.group_id) for item in self.requirements
@@ -211,61 +277,12 @@ class SolverV2Request(_StrictModel):
         if any(item.group_id not in groups for item in self.requirements):
             raise ValueError("requirements must use a declared group")
         expected_requirements = {
-            (day, start, group) for day, start in slot_keys for group in self.groups
+            (day, start, group) for day, start in operating_slots for group in groups
         }
         if set(requirement_keys) != expected_requirements:
             raise ValueError(
                 "every operating slot needs an explicit requirement for every group, including zero"
             )
-
-        employee_ids = [employee.id for employee in self.employees]
-        if len(employee_ids) != len(set(employee_ids)):
-            raise ValueError("employee ids must be unique")
-        for employee in self.employees:
-            if len(employee.skills) != len(set(employee.skills)):
-                raise ValueError(f"skills for employee {employee.id} must be unique")
-            if not set(employee.skills) <= groups:
-                raise ValueError(
-                    f"skills for employee {employee.id} must use declared groups"
-                )
-            availability = [(slot.date, slot.start) for slot in employee.available_slots]
-            if len(availability) != len(set(availability)):
-                raise ValueError(
-                    f"available slots for employee {employee.id} must be unique"
-                )
-            if not set(availability) <= operating_slots:
-                raise ValueError(
-                    f"available slots for employee {employee.id} must be operating slots"
-                )
-            unavailable = employee.unavailable_dates
-            if len(unavailable) != len(set(unavailable)):
-                raise ValueError(
-                    f"unavailable dates for employee {employee.id} must be unique"
-                )
-            if any(day not in week_dates for day in unavailable):
-                raise ValueError(
-                    f"unavailable dates for employee {employee.id} must be within the week"
-                )
-            unavailable_set = set(unavailable)
-            if any(day in unavailable_set for day, _ in availability):
-                raise ValueError(
-                    f"employee {employee.id} cannot be available on an unavailable date"
-                )
-
-        shift_keys = [(shift.date, shift.start) for shift in self.shift_starts]
-        if len(shift_keys) != len(set(shift_keys)):
-            raise ValueError("shift starts must be unique")
-        for day, start in shift_keys:
-            if day not in week_dates:
-                raise ValueError("shift starts must be within the declared week")
-            start_minute = _minutes(start)
-            if start_minute > 22 * 60:
-                raise ValueError("90-minute shifts must end on the same day")
-            if any(
-                (day, _time_text(start_minute + offset)) not in operating_slots
-                for offset in (0, 30, 60)
-            ):
-                raise ValueError("each shift must contain three operating slots")
         return self
 
 

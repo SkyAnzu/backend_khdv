@@ -161,6 +161,134 @@ def test_schedule_v2_rejects_malformed_payloads_with_safe_422(mutate):
     assert all("input" not in error and "ctx" not in error for error in errors)
 
 
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda request: request["employees"].append(
+            deepcopy(request["employees"][0])
+        ),
+        lambda request: request["employees"][0].update(
+            skills=["PRIVATE-UNKNOWN-SKILL"]
+        ),
+        lambda request: request["employees"][0]["available_slots"].append(
+            {"date": "2026-11-02", "start": "07:00"}
+        ),
+        lambda request: request["employees"][0].update(
+            unavailable_dates=["2026-11-02"]
+        ),
+        lambda request: request["employees"][0].update(
+            unavailable_dates=["2026-11-09"]
+        ),
+        lambda request: request["employees"][0]["available_slots"].append(
+            deepcopy(request["employees"][0]["available_slots"][0])
+        ),
+        lambda request: request["shift_starts"][0].update(start="07:30"),
+        lambda request: request["shift_starts"].append(
+            deepcopy(request["shift_starts"][0])
+        ),
+    ],
+)
+def test_schedule_v2_rejects_invalid_solver_configuration_with_safe_422(mutate):
+    request = load_sample("pipeline-planned-calls-request.json")
+    mutate(request)
+
+    response = TestClient(app, raise_server_exceptions=False).post(
+        "/api/schedule-v2", json=request
+    )
+
+    assert response.status_code == 422
+    errors = response.json()["detail"]
+    assert errors
+    assert all(error["msg"] == "Invalid value for this field." for error in errors)
+    assert "PRIVATE-UNKNOWN-SKILL" not in response.text
+    assert "Traceback" not in response.text
+
+
+def test_schedule_v2_rejects_duplicate_history_rows_with_safe_422():
+    marker = "PRIVATE-DUPLICATE-HISTORY"
+    request = load_sample("pipeline-history-request.json")
+    duplicate = {
+        "date": "2026-10-26",
+        "hour": 8,
+        "group_id": marker,
+        "calls": 4,
+    }
+    request["history"].extend([duplicate, deepcopy(duplicate)])
+
+    response = TestClient(app, raise_server_exceptions=False).post(
+        "/api/schedule-v2", json=request
+    )
+
+    assert response.status_code == 422
+    errors = response.json()["detail"]
+    assert errors
+    assert all(error["msg"] == "Invalid value for this field." for error in errors)
+    assert marker not in response.text
+    assert "Traceback" not in response.text
+
+
+def test_schedule_v2_allows_unique_history_for_unselected_group():
+    request = load_sample("pipeline-history-request.json")
+    request["history"].append(
+        {
+            "date": "2026-10-26",
+            "hour": 8,
+            "group_id": "unselected-support",
+            "calls": 7,
+        }
+    )
+
+    response = client.post("/api/schedule-v2", json=request)
+
+    assert response.status_code == 200, response.text
+    assert all(
+        item["group_id"] == "sales"
+        for item in response.json()["forecast"]["forecasts"]
+    )
+
+
+@pytest.mark.parametrize(
+    "sample",
+    [
+        "pipeline-planned-calls-request.json",
+        "pipeline-history-request.json",
+    ],
+)
+def test_schedule_v2_rejects_zero_aht_when_calls_are_positive_with_safe_422(sample):
+    request = load_sample(sample)
+    request["aht_seconds"] = 0.0
+
+    response = TestClient(app, raise_server_exceptions=False).post(
+        "/api/schedule-v2", json=request
+    )
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "detail": "AHT seconds must be positive when calls are nonzero."
+    }
+    assert "Traceback" not in response.text
+
+
+def test_schedule_v2_allows_zero_aht_when_all_calls_are_zero():
+    request = load_sample("pipeline-planned-calls-request.json")
+    request["planned_calls"] = [
+        {**item, "calls_per_hour": 0.0} for item in request["planned_calls"]
+    ]
+    request["aht_seconds"] = 0.0
+    request["employees"] = []
+    request["shift_starts"] = []
+
+    response = client.post("/api/schedule-v2", json=request)
+
+    assert response.status_code == 200, response.text
+    result = response.json()
+    assert all(
+        item["erlang"] == {"required_staff": 0, "service_level": None}
+        for item in result["hourly_results"]
+    )
+    assert result["schedule"]["status"] == "OPTIMAL"
+
+
 def test_schedule_v2_rejects_more_than_50_employees_before_solving():
     request = load_sample("pipeline-planned-calls-request.json")
     employee = request["employees"][0]
@@ -241,11 +369,10 @@ def test_schedule_v2_returns_domain_errors_as_422_without_traceback():
     assert "Traceback" not in response.text
 
 
-def test_schedule_v2_sanitizes_internal_validation_error_input_values():
+def test_schedule_v2_sanitizes_insufficient_history_error():
     marker = "PRIVATE-MARKER-7f2a"
     request = load_sample("pipeline-history-request.json")
     request["groups"] = [marker]
-    request["operating_hours"] = [{"date": "2026-11-02", "hour": 9}]
     request["history"] = [
         {
             "date": "2026-10-26",

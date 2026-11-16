@@ -159,6 +159,12 @@ class HourlyCallObservation(_HourlyCallKey):
         return value
 
 
+def validate_history_keys_unique(history: list[HourlyCallObservation]) -> None:
+    history_keys = [(point.date, point.hour, point.group_id) for point in history]
+    if len(history_keys) != len(set(history_keys)):
+        raise ValueError("history date/hour/group keys must be unique")
+
+
 class ForecastTarget(_HourlyCallKey):
     pass
 
@@ -169,11 +175,7 @@ class ForecastRequest(BaseModel):
 
     @model_validator(mode="after")
     def forecast_inputs_are_valid(self) -> "ForecastRequest":
-        history_keys = [
-            (point.date, point.hour, point.group_id) for point in self.history
-        ]
-        if len(history_keys) != len(set(history_keys)):
-            raise ValueError("history date/hour/group keys must be unique")
+        validate_history_keys_unique(self.history)
 
         target_keys = [
             (point.date, point.hour, point.group_id) for point in self.targets
@@ -212,6 +214,11 @@ class ForecastResponse(BaseModel):
     forecasts: list[HourlyForecast] = Field(min_length=1)
 
 
+def validate_aht_for_calls(calls_per_hour: float, aht_seconds: float) -> None:
+    if calls_per_hour > 0 and aht_seconds <= 0:
+        raise ValueError("AHT seconds must be positive when calls are nonzero")
+
+
 class ErlangCRequest(BaseModel):
     calls_per_hour: StrictFloat = Field(ge=0, allow_inf_nan=False)
     aht_seconds: StrictFloat = Field(ge=0, allow_inf_nan=False)
@@ -225,8 +232,7 @@ class ErlangCRequest(BaseModel):
 
     @model_validator(mode="after")
     def aht_is_positive_for_nonzero_calls(self) -> "ErlangCRequest":
-        if self.calls_per_hour > 0 and self.aht_seconds <= 0:
-            raise ValueError("AHT seconds must be positive when calls are nonzero")
+        validate_aht_for_calls(self.calls_per_hour, self.aht_seconds)
         return self
 
 

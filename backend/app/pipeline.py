@@ -27,6 +27,8 @@ from .models import (
     ForecastTarget,
     HourlyCallObservation,
     MAX_ERLANG_C_AGENTS,
+    validate_aht_for_calls,
+    validate_history_keys_unique,
 )
 from .solver_v2 import (
     MAX_EMPLOYEES,
@@ -42,6 +44,7 @@ from .solver_v2 import (
     SolverV2Request,
     SolverV2Response,
     solve_schedule_v2,
+    validate_solver_configuration,
 )
 
 
@@ -211,6 +214,22 @@ class PipelineRequest(_StrictModel):
             if ordered_hours != list(range(ordered_hours[0], ordered_hours[-1] + 1)):
                 raise ValueError("operating hours must be contiguous within each date")
 
+        if self.history is not None:
+            validate_history_keys_unique(self.history)
+
+        operating_slots = [
+            OperatingSlot(date=item.date, start=start)
+            for item in self.operating_hours
+            for start in (f"{item.hour:02d}:00", f"{item.hour:02d}:30")
+        ]
+        validate_solver_configuration(
+            self.week_start,
+            self.groups,
+            operating_slots,
+            self.employees,
+            self.shift_starts,
+        )
+
         if self.mode == "history":
             if not self.history:
                 raise ValueError("history mode requires non-empty history")
@@ -329,6 +348,13 @@ def run_pipeline(request: PipelineRequest) -> PipelineResponse:
 
     hourly_results = []
     for day, hour, group_id, calls, sample_count in hourly_calls:
+        try:
+            validate_aht_for_calls(calls, request.aht_seconds)
+        except ValueError as error:
+            raise PipelineDomainError(
+                str(error),
+                public_message="AHT seconds must be positive when calls are nonzero.",
+            ) from error
         try:
             erlang = calculate_required_staff(
                 ErlangCRequest(
