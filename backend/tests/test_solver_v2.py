@@ -549,6 +549,124 @@ def test_unproven_second_stage_keeps_or_returns_a_feasible_schedule(
 
 
 @pytest.mark.parametrize(
+    ("first_plan", "second_plan", "expected_plan"),
+    [
+        (
+            frozenset({("e1", "08:00")}),
+            frozenset({("e1", "08:00")}),
+            frozenset({("e1", "08:00")}),
+        ),
+        (
+            frozenset({("e1", "08:00"), ("e2", "08:30")}),
+            frozenset({("e2", "08:30")}),
+            frozenset({("e2", "08:30")}),
+        ),
+        (
+            frozenset({("e1", "08:00")}),
+            frozenset({("e1", "08:00"), ("e2", "08:30")}),
+            frozenset({("e1", "08:00")}),
+        ),
+    ],
+    ids=("equal", "better", "worse"),
+)
+def test_feasible_second_stage_never_replaces_incumbent_with_more_slots(
+    monkeypatch, first_plan, second_plan, expected_plan
+):
+    slots = slot_range(starts=("08:00", "08:30", "09:00", "09:30"))
+    payload = make_payload(
+        slots,
+        shifts=[
+            {"date": WEEK, "start": "08:00"},
+            {"date": WEEK, "start": "08:30"},
+        ],
+        demands={
+            (WEEK, "08:30", "sales"): 1,
+            (WEEK, "09:00", "sales"): 1,
+        },
+        employees=[
+            employee(
+                employee_id,
+                skills=("sales",),
+                available=[{"date": day, "start": start} for day, start in slots],
+                max_minutes=90,
+            )
+            for employee_id in ("e1", "e2")
+        ],
+        groups=["sales"],
+    )
+    real_solver = cp_model.CpSolver
+    plans = iter((first_plan, second_plan))
+    statuses = iter((cp_model.OPTIMAL, cp_model.FEASIBLE))
+
+    class ScriptedSolver:
+        def __init__(self):
+            self.inner = real_solver()
+            self.plan = frozenset()
+
+        @property
+        def parameters(self):
+            return self.inner.parameters
+
+        def solve(self, model):
+            assert self.inner.solve(model) == cp_model.OPTIMAL
+            self.plan = next(plans)
+            return next(statuses)
+
+        def value(self, variable):
+            parts = variable.name.split("_")
+            employee = payload["employees"][int(parts[1][1:])]["id"]
+            shift = payload["shift_starts"][int(parts[2][1:])]["start"]
+            selected = (employee, shift) in self.plan
+            return int(selected and (parts[0] == "work" or parts[4] == "g0"))
+
+    def assert_plan_is_valid(plan):
+        employees = {item["id"]: item for item in payload["employees"]}
+        required = {
+            (item["date"], item["start"], item["group_id"]): item["required_staff"]
+            for item in payload["requirements"]
+            if item["required_staff"]
+        }
+        employee_slots, minutes, coverage = set(), {}, {}
+        for employee_id, start in plan:
+            worker = employees[employee_id]
+            assert "sales" in worker["skills"]
+            shift_minutes = int(start[:2]) * 60 + int(start[3:])
+            shift_slots = [
+                f"{(shift_minutes + offset) // 60:02d}:{(shift_minutes + offset) % 60:02d}"
+                for offset in (0, 30, 60)
+            ]
+            available = {(slot["date"], slot["start"]) for slot in worker["available_slots"]}
+            assert all((WEEK, slot) in available for slot in shift_slots)
+            minutes[employee_id] = minutes.get(employee_id, 0) + 90
+            for slot in shift_slots:
+                key = (employee_id, WEEK, slot)
+                assert key not in employee_slots
+                employee_slots.add(key)
+                key = (WEEK, slot, "sales")
+                coverage[key] = coverage.get(key, 0) + 1
+
+        assert all(minutes[id] <= employees[id]["max_work_minutes_per_week"] for id in minutes)
+        assert all(coverage.get(key, 0) >= count for key, count in required.items())
+
+    assert_plan_is_valid(first_plan)
+    assert_plan_is_valid(second_plan)
+    monkeypatch.setattr(solver_v2.cp_model, "CpSolver", ScriptedSolver)
+
+    result = solve_schedule_v2(SolverV2Request.model_validate(payload))
+
+    assert {(item.employee_id, item.start) for item in result.assignments} == expected_plan
+    assert result.status == "FEASIBLE"
+    assert result.stage_two_status == "FEASIBLE"
+    assert result.total_employee_slots == 3
+    assert result.skill_mismatch_slots == 0
+    assert result.overstaff_slots == 1
+    assert result.warnings == ["Có 1 person-slots vượt nhu cầu theo nhóm/slot."]
+    if len(second_plan) > len(first_plan):
+        assert "giữ lịch bước một" in result.message
+        assert "chưa được chứng minh" in result.message
+
+
+@pytest.mark.parametrize(
     ("first_status", "expected"),
     [
         (cp_model.UNKNOWN, "UNKNOWN"),

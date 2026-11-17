@@ -555,6 +555,18 @@ def solve_schedule_v2(request: SolverV2Request) -> SolverV2Response:
         assignments = _assignments_from_solver(
             request, second_solver, work_vars, assignment_vars
         )
+        candidate_slots = sum(len(item.groups_by_slot) for item in assignments)
+        incumbent_slots = sum(
+            len(item.groups_by_slot) for item in first_assignments
+        )
+        if second_status == "FEASIBLE" and candidate_slots > incumbent_slots:
+            return _response_with_schedule(
+                request,
+                first_assignments,
+                "FEASIBLE",
+                "Đã chứng minh mức lệch kỹ năng tối thiểu; giữ lịch bước một vì ứng viên bước hai dùng nhiều slot làm hơn. Tối ưu tổng slot làm chưa được chứng minh.",
+                second_status,
+            )
         message = (
             "Đã chứng minh tối ưu tuần tự: trước hết lệch kỹ năng, sau đó tổng slot làm."
             if second_status == "OPTIMAL"
