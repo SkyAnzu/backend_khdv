@@ -1,4 +1,4 @@
-"""Bounded in-memory import of hourly call rows from CSV or XLSX."""
+"""Bounded in-memory import of 30-minute call rows from CSV or XLSX."""
 
 from collections.abc import Collection, Iterable, Sequence
 import csv
@@ -15,17 +15,16 @@ from openpyxl import load_workbook
 from openpyxl.xml import DEFUSEDXML
 from pydantic import ValidationError
 
+from .limits import MAX_UPLOAD_BYTES
+from .models import CallIntervalObservation, PlannedCallInterval
 from .pipeline import (
     MAX_HISTORY_ROWS,
-    MAX_HOURLY_CALL_ROWS,
-    PipelineHistoryObservation,
-    PipelinePlannedCalls,
+    MAX_INTERVAL_ROWS,
 )
 from .solver_v2 import MAX_GROUPS, MAX_IDENTIFIER_LENGTH
 
 
-HEADER = ("date", "hour", "group_id", "calls")
-MAX_FILE_BYTES = 2 * 1024 * 1024
+HEADER = ("date", "start", "group_id", "calls")
 MAX_IMPORT_ROWS = 10_000
 MAX_XLSX_ENTRIES = 100
 MAX_XLSX_UNCOMPRESSED_BYTES = 20 * 1024 * 1024
@@ -59,8 +58,8 @@ _RELATIONSHIPS_ID = (
 )
 
 CallImportMode = Literal["history", "planned_calls"]
-CallImportFormat = Literal["csv", "xlsx"]
-CallImportRecord = PipelineHistoryObservation | PipelinePlannedCalls
+CallImportFormat = Literal["csv", "xlsx", "database_sample_bundle"]
+CallImportRecord = CallIntervalObservation | PlannedCallInterval
 
 
 class CallImportError(ValueError):
@@ -74,11 +73,11 @@ def parse_calls_import(
     mode: CallImportMode,
     group_ids: Collection[str],
 ) -> list[CallImportRecord]:
-    """Parse in-memory call rows into the matching existing pipeline models."""
+    """Parse in-memory call rows into four-field interval models."""
     if not isinstance(data, bytes):
         raise CallImportError("Import data must be provided as bytes.")
-    if len(data) > MAX_FILE_BYTES:
-        raise CallImportError("Import file exceeds the 2 MiB size limit.")
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise CallImportError("Import file exceeds the configured size limit.")
     if file_format not in ("csv", "xlsx"):
         raise CallImportError("File format must be CSV or XLSX.")
     if mode not in ("history", "planned_calls"):
@@ -87,7 +86,7 @@ def parse_calls_import(
     allowed_groups = _normalize_groups(group_ids)
     max_rows = min(
         MAX_IMPORT_ROWS,
-        MAX_HISTORY_ROWS if mode == "history" else MAX_HOURLY_CALL_ROWS,
+        MAX_HISTORY_ROWS if mode == "history" else MAX_INTERVAL_ROWS,
     )
     if file_format == "csv":
         return _parse_csv(data, mode, allowed_groups, max_rows)
@@ -131,7 +130,7 @@ def _parse_csv(
         header = next(reader, None)
         if header != list(HEADER):
             raise CallImportError(
-                "CSV row 1: header must be exactly date,hour,group_id,calls."
+                "CSV row 1: header must be exactly date,start,group_id,calls."
             )
         return _read_rows(
             (
@@ -160,7 +159,7 @@ def _read_rows(
     max_rows: int,
 ) -> list[CallImportRecord]:
     records: list[CallImportRecord] = []
-    seen: set[tuple[date, int, str]] = set()
+    seen: set[tuple[date, str, str]] = set()
     for row_number, (values, source_row) in enumerate(rows, start=1):
         if row_number > max_rows:
             raise CallImportError(
@@ -175,10 +174,10 @@ def _read_rows(
             raise CallImportError(
                 f"{file_format} row {source_row}: group_id is not in the selected groups."
             )
-        key = (record.date, record.hour, record.group_id)
+        key = (record.date, record.start, record.group_id)
         if key in seen:
             raise CallImportError(
-                f"{file_format} row {source_row}: duplicate date/hour/group row."
+                f"{file_format} row {source_row}: duplicate date/start/group row."
             )
         seen.add(key)
         records.append(record)
@@ -193,10 +192,10 @@ def _make_record(
     file_format: str,
     row_number: int,
 ) -> CallImportRecord:
-    raw_date, raw_hour, raw_group_id, raw_calls = values
+    raw_date, raw_start, raw_group_id, raw_calls = values
     if file_format == "CSV":
         date_value = raw_date
-        hour = _parse_csv_integer(raw_hour, file_format, row_number, "hour")
+        start = raw_start
         if mode == "history":
             calls: int | float = _parse_csv_integer(
                 raw_calls, file_format, row_number, "calls"
@@ -205,23 +204,18 @@ def _make_record(
             calls = _parse_csv_float(raw_calls, file_format, row_number)
     else:
         date_value = _parse_xlsx_date(raw_date, file_format, row_number)
-        hour = _parse_xlsx_integer(raw_hour, file_format, row_number, "hour")
+        start = _parse_xlsx_start(raw_start, file_format, row_number)
         if mode == "history":
             calls = _parse_xlsx_integer(raw_calls, file_format, row_number, "calls")
         else:
             calls = _parse_xlsx_float(raw_calls, file_format, row_number)
-    if not 0 <= hour <= 22:
-        raise CallImportError(
-            f"{file_format} row {row_number}: hour must be an integer from 0 through 22."
-        )
-
     payload = {
         "date": date_value,
-        "hour": hour,
+        "start": start,
         "group_id": raw_group_id,
     }
-    model = PipelineHistoryObservation if mode == "history" else PipelinePlannedCalls
-    payload["calls" if mode == "history" else "calls_per_hour"] = calls
+    model = CallIntervalObservation if mode == "history" else PlannedCallInterval
+    payload["calls"] = calls
     try:
         return model.model_validate(payload)
     except ValidationError as error:
@@ -277,6 +271,18 @@ def _parse_xlsx_date(
     if isinstance(value, (date, str)):
         return value
     raise CallImportError(f"{file_format} row {row_number}: invalid date.")
+
+
+def _parse_xlsx_start(value: object, file_format: str, row_number: int) -> str:
+    if isinstance(value, time):
+        if value.tzinfo is not None or value.second or value.microsecond:
+            raise CallImportError(
+                f"{file_format} row {row_number}: start must align to 30 minutes."
+            )
+        return value.strftime("%H:%M")
+    if isinstance(value, str):
+        return value
+    raise CallImportError(f"{file_format} row {row_number}: invalid start.")
 
 
 def _parse_xlsx_integer(
@@ -347,7 +353,7 @@ def _parse_xlsx(
                     if row_number == 1:
                         if values != list(HEADER):
                             raise CallImportError(
-                                "XLSX row 1: header must be exactly date,hour,group_id,calls."
+                                "XLSX row 1: header must be exactly date,start,group_id,calls."
                             )
                         continue
                     if not any(value is not None for value in values):

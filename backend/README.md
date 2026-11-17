@@ -1,17 +1,14 @@
 # `backend/`
 
-Đây là package Python của prototype A. Chạy lệnh từ **repo root**
-`backend_khdv`, không chạy từ thư mục `backend/`, vì test và CLI import
-`backend.app`.
+Package Python của backend scheduling prototype. Chạy lệnh từ repo root
+`backend_khdv` để test import `backend.app` và khởi động API:
 
 ```powershell
 .\.venv\Scripts\python.exe -m pytest backend\tests -q
-.\.venv\Scripts\python.exe -m backend.app.demo backend\samples\feasible.json
-.\.venv\Scripts\python.exe -m backend.app.demo backend\samples\infeasible.json
 .\.venv\Scripts\python.exe -m uvicorn backend.app.main:app --reload --host 127.0.0.1 --port 8000
 ```
 
-Dependency source duy nhất của prototype là `backend/requirements.txt`. Solver
-v1 giữ nguyên hai rule cũ; `app/solver_v2.py` vẫn không có route riêng, nhưng
-được gọi bởi pipeline prototype `POST /api/schedule-v2`. Xem README tại repo
-root để biết input/output và giới hạn.
+Pipeline hiện dùng demand/forecast từng interval 30 phút, Erlang C theo queue
+(`calls_per_hour = 2 * calls_per_interval`) và solver v2 với shifts có envelope
+và breaks. Xem [README ở repo root](../README.md) để biết payload, import/export,
+body limits, và các giới hạn prototype.

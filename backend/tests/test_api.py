@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from backend.app import pipeline
+from backend.app import main, pipeline, solver_v2
 from backend.app.main import app
 from backend.app.solver_v2 import SolverV2Response
 
@@ -18,97 +18,89 @@ def load_sample(name):
     return json.loads((SAMPLES / name).read_text(encoding="utf-8"))
 
 
+def post_schedule(request):
+    return client.post("/api/schedule-v2", json=request)
+
+
 def test_health():
     response = client.get("/health")
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
 
 
-def test_solver_preview_accepts_json_and_returns_result():
-    response = client.post(
-        "/api/solver-preview",
-        json={
-            "employees": [{"id": "e01", "name": "An"}],
-            "shift_templates": [
-                {"id": "s1", "name": "Ca sáng", "start": "08:00", "end": "12:00"}
-            ],
-            "requirements": [
-                {"date": "2026-11-02", "start": "08:00", "end": "12:00", "required_staff": 1}
-            ],
-        },
-    )
-    assert response.status_code == 200
-    assert response.json()["status"] in {"FEASIBLE", "OPTIMAL"}
-    assert response.json()["assignments"][0]["employee_id"] == "e01"
+def test_retired_solver_preview_is_not_routed_or_documented():
+    assert client.post("/api/solver-preview", json={}).status_code == 404
+    assert "/api/solver-preview" not in client.get("/openapi.json").json()["paths"]
 
 
-def test_schedule_v2_runs_planned_calls_sample_and_returns_full_pipeline_result():
-    response = client.post(
-        "/api/schedule-v2",
-        json=load_sample("pipeline-planned-calls-request.json"),
-    )
+def test_schedule_v2_planned_calls_are_half_hour_rows_and_rate_doubles():
+    response = post_schedule(load_sample("pipeline-planned-calls-request.json"))
 
     assert response.status_code == 200, response.text
     result = response.json()
     assert result["mode"] == "planned_calls"
     assert result["forecast"] is None
-    assert result["hourly_results"][0] == {
-        "date": "2026-11-02",
-        "hour": 8,
-        "group_id": "sales",
-        "calls_per_hour": 0.5,
-        "sample_count": None,
-        "erlang": {
-            "required_staff": 1,
-            "service_level": pytest.approx(0.9609, abs=0.0001),
-        },
-    }
+    assert result["groups"] == [{"id": "sales", "name": "Sales"}]
     assert [
-        (item["start"], item["required_staff"]) for item in result["requirements"]
-    ] == [("08:00", 1), ("08:30", 1), ("09:00", 0), ("09:30", 0)]
-    assert result["schedule"]["status"] in {"OPTIMAL", "FEASIBLE"}
-    assert result["schedule"]["stage_two_status"] in {"OPTIMAL", "FEASIBLE"}
-    assert result["schedule"]["warnings"] == [
-        "Có 1 person-slots vượt nhu cầu theo nhóm/slot."
-    ]
-    assert result["schedule"]["assignments"][0]["employee_id"] == "e01"
-    assert len(result["schedule"]["assignments"][0]["groups_by_slot"]) == 3
-
-
-def test_schedule_v2_runs_history_sample_and_preserves_forecast():
-    response = client.post(
-        "/api/schedule-v2",
-        json=load_sample("pipeline-history-request.json"),
+        (item["start"], item["calls"], item["sample_count"])
+        for item in result["interval_results"]
+    ] == [("08:00", 0.5, None), ("08:30", 0.5, None)]
+    assert all(
+        item["erlang"]["required_staff"] == 1
+        and item["assigned_staff"] == 1
+        for item in result["interval_results"]
     )
+    assert "requirements" not in result
+    assert all("source_status" not in item for item in result["interval_results"])
+    assert result["schedule"]["status"] in {"OPTIMAL", "FEASIBLE"}
+    assert result["schedule"]["total_shift_minutes"] == 60
+    assert result["schedule"]["assignments"][0]["end"] == "09:00"
+    assert result["schedule"]["assignments"][0]["breaks"] == []
+    assert [
+        item["start"]
+        for item in result["schedule"]["assignments"][0]["groups_by_slot"]
+    ] == ["08:00", "08:30"]
+
+
+def test_schedule_v2_history_uses_window_and_preserves_interval_forecast():
+    response = post_schedule(load_sample("pipeline-history-request.json"))
 
     assert response.status_code == 200, response.text
     result = response.json()
     assert result["mode"] == "history"
-    assert result["forecast"]["forecasts"][0] == {
-        "date": "2026-11-02",
-        "hour": 8,
-        "group_id": "sales",
-        "forecast_calls": 2.5,
-        "sample_count": 2,
-    }
-    assert result["hourly_results"][0]["calls_per_hour"] == 2.5
-    assert result["hourly_results"][0]["sample_count"] == 2
+    assert result["forecast"]["forecasts"] == [
+        {
+            "date": "2026-11-02",
+            "start": "08:00",
+            "group_id": "sales",
+            "forecast_calls": 3.0,
+            "sample_count": 2,
+        },
+        {
+            "date": "2026-11-02",
+            "start": "08:30",
+            "group_id": "sales",
+            "forecast_calls": 0.0,
+            "sample_count": 2,
+        },
+    ]
+    assert result["interval_results"][0]["calls"] == 3.0
+    assert result["interval_results"][0]["sample_count"] == 2
     assert result["schedule"]["status"] in {"OPTIMAL", "FEASIBLE"}
 
 
-def test_schedule_v2_zero_demand_returns_null_service_level_and_empty_schedule():
+def test_schedule_v2_zero_calls_need_no_aht_and_return_null_sla():
     request = load_sample("pipeline-planned-calls-request.json")
-    request["planned_calls"] = [
-        {**item, "calls_per_hour": 0.0} for item in request["planned_calls"]
-    ]
+    request["planned_calls"] = [{**item, "calls": 0.0} for item in request["planned_calls"]]
+    request["aht_by_group"] = []
     request["employees"] = []
-    request["shift_starts"] = []
+    request["shifts"] = []
 
-    response = client.post("/api/schedule-v2", json=request)
+    response = post_schedule(request)
 
     assert response.status_code == 200, response.text
     result = response.json()
-    assert [item["erlang"] for item in result["hourly_results"]] == [
+    assert [item["erlang"] for item in result["interval_results"]] == [
         {"required_staff": 0, "service_level": None},
         {"required_staff": 0, "service_level": None},
     ]
@@ -116,16 +108,30 @@ def test_schedule_v2_zero_demand_returns_null_service_level_and_empty_schedule()
     assert result["schedule"]["assignments"] == []
 
 
-def test_schedule_v2_preserves_infeasible_status_instead_of_returning_http_error():
+def test_schedule_v2_positive_calls_without_aht_are_a_domain_422():
+    request = load_sample("pipeline-planned-calls-request.json")
+    request["aht_by_group"] = []
+
+    response = post_schedule(request)
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "detail": "AHT seconds are required for groups with positive calls."
+    }
+
+
+def test_schedule_v2_preserves_infeasible_solver_status():
     request = load_sample("pipeline-planned-calls-request.json")
     request["employees"] = []
 
-    response = client.post("/api/schedule-v2", json=request)
+    response = post_schedule(request)
 
     assert response.status_code == 200, response.text
-    assert response.json()["schedule"]["status"] == "INFEASIBLE"
-    assert response.json()["schedule"]["assignments"] == []
-    assert response.json()["schedule"]["stage_two_status"] is None
+    result = response.json()
+    assert result["schedule"]["status"] == "INFEASIBLE"
+    assert result["schedule"]["assignments"] == []
+    assert result["schedule"]["stage_two_status"] is None
+    assert all(item["assigned_staff"] is None for item in result["interval_results"])
 
 
 @pytest.mark.parametrize(
@@ -135,24 +141,19 @@ def test_schedule_v2_preserves_infeasible_status_instead_of_returning_http_error
         lambda request: request["planned_calls"].append(
             deepcopy(request["planned_calls"][0])
         ),
-        lambda request: request["planned_calls"].append(
-            {
-                "date": "2026-11-02",
-                "hour": 10,
-                "group_id": "sales",
-                "calls_per_hour": 0.0,
-            }
-        ),
+        lambda request: request["planned_calls"][0].update(start="08:15"),
         lambda request: request["employees"][0]["available_slots"][0].update(
-            start="8:00"
+            start="08:15"
         ),
+        lambda request: request.update(operating_intervals=[]),
+        lambda request: request["service_targets"].pop(),
     ],
 )
-def test_schedule_v2_rejects_malformed_payloads_with_safe_422(mutate):
+def test_schedule_v2_rejects_malformed_inputs_as_sanitized_422(mutate):
     request = load_sample("pipeline-planned-calls-request.json")
     mutate(request)
 
-    response = client.post("/api/schedule-v2", json=request)
+    response = post_schedule(request)
 
     assert response.status_code == 422
     errors = response.json()["detail"]
@@ -164,31 +165,19 @@ def test_schedule_v2_rejects_malformed_payloads_with_safe_422(mutate):
 @pytest.mark.parametrize(
     "mutate",
     [
-        lambda request: request["employees"].append(
-            deepcopy(request["employees"][0])
-        ),
-        lambda request: request["employees"][0].update(
-            skills=["PRIVATE-UNKNOWN-SKILL"]
-        ),
+        lambda request: request["employees"].append(deepcopy(request["employees"][0])),
+        lambda request: request["employees"][0].update(skills=["PRIVATE_UNKNOWN"]),
         lambda request: request["employees"][0]["available_slots"].append(
-            {"date": "2026-11-02", "start": "07:00"}
+            {"date": "2026-11-02", "start": "07:30"}
         ),
         lambda request: request["employees"][0].update(
             unavailable_dates=["2026-11-02"]
         ),
-        lambda request: request["employees"][0].update(
-            unavailable_dates=["2026-11-09"]
-        ),
-        lambda request: request["employees"][0]["available_slots"].append(
-            deepcopy(request["employees"][0]["available_slots"][0])
-        ),
-        lambda request: request["shift_starts"][0].update(start="07:30"),
-        lambda request: request["shift_starts"].append(
-            deepcopy(request["shift_starts"][0])
-        ),
+        lambda request: request["shifts"][0].update(start="07:30"),
+        lambda request: request["shifts"].append(deepcopy(request["shifts"][0])),
     ],
 )
-def test_schedule_v2_rejects_invalid_solver_configuration_with_safe_422(mutate):
+def test_schedule_v2_rejects_invalid_solver_configuration_safely(mutate):
     request = load_sample("pipeline-planned-calls-request.json")
     mutate(request)
 
@@ -197,110 +186,106 @@ def test_schedule_v2_rejects_invalid_solver_configuration_with_safe_422(mutate):
     )
 
     assert response.status_code == 422
-    errors = response.json()["detail"]
-    assert errors
-    assert all(error["msg"] == "Invalid value for this field." for error in errors)
-    assert "PRIVATE-UNKNOWN-SKILL" not in response.text
+    assert all(
+        item["msg"] == "Invalid value for this field."
+        for item in response.json()["detail"]
+    )
+    assert "PRIVATE_UNKNOWN" not in response.text
     assert "Traceback" not in response.text
 
 
-def test_schedule_v2_rejects_duplicate_history_rows_with_safe_422():
-    marker = "PRIVATE-DUPLICATE-HISTORY"
+def test_schedule_v2_rejects_history_outside_window_and_duplicate_rows():
     request = load_sample("pipeline-history-request.json")
-    duplicate = {
-        "date": "2026-10-26",
-        "hour": 8,
-        "group_id": marker,
-        "calls": 4,
-    }
-    request["history"].extend([duplicate, deepcopy(duplicate)])
+    request["history"][0]["date"] = "2026-09-28"
+    response = post_schedule(request)
+    assert response.status_code == 422
+    assert all(
+        item["msg"] == "Invalid value for this field."
+        for item in response.json()["detail"]
+    )
+
+    request = load_sample("pipeline-history-request.json")
+    request["history"].append(deepcopy(request["history"][0]))
+    response = post_schedule(request)
+    assert response.status_code == 422
+
+
+def test_schedule_v2_rejects_undeclared_history_groups_before_pipeline(monkeypatch):
+    request = load_sample("pipeline-history-request.json")
+    request["history"] = [{**row, "calls": 0} for row in request["history"]]
+    sales_history = list(request["history"])
+    request["history"].extend(
+        {**row, "group_id": "queue999", "calls": 999}
+        for row in sales_history
+        if row["start"] == "08:00"
+    )
+    pipeline_called = False
+
+    def unexpected_pipeline_call(_request):
+        nonlocal pipeline_called
+        pipeline_called = True
+        raise RuntimeError("invalid history reached pipeline")
+
+    monkeypatch.setattr(main, "run_pipeline", unexpected_pipeline_call)
 
     response = TestClient(app, raise_server_exceptions=False).post(
         "/api/schedule-v2", json=request
     )
 
     assert response.status_code == 422
-    errors = response.json()["detail"]
-    assert errors
-    assert all(error["msg"] == "Invalid value for this field." for error in errors)
-    assert marker not in response.text
-    assert "Traceback" not in response.text
-
-
-def test_schedule_v2_allows_unique_history_for_unselected_group():
-    request = load_sample("pipeline-history-request.json")
-    request["history"].append(
-        {
-            "date": "2026-10-26",
-            "hour": 8,
-            "group_id": "unselected-support",
-            "calls": 7,
-        }
-    )
-
-    response = client.post("/api/schedule-v2", json=request)
-
-    assert response.status_code == 200, response.text
+    assert not pipeline_called
     assert all(
-        item["group_id"] == "sales"
-        for item in response.json()["forecast"]["forecasts"]
+        error["msg"] == "Invalid value for this field."
+        for error in response.json()["detail"]
     )
+    assert "queue999" not in response.text
 
 
-@pytest.mark.parametrize(
-    "sample",
-    [
-        "pipeline-planned-calls-request.json",
-        "pipeline-history-request.json",
-    ],
-)
-def test_schedule_v2_rejects_zero_aht_when_calls_are_positive_with_safe_422(sample):
-    request = load_sample(sample)
-    request["aht_seconds"] = 0.0
+def test_schedule_v2_requires_two_distinct_matching_history_dates():
+    request = load_sample("pipeline-history-request.json")
+    request["history"] = [
+        row for row in request["history"] if row["date"] == "2026-10-19"
+    ]
 
-    response = TestClient(app, raise_server_exceptions=False).post(
-        "/api/schedule-v2", json=request
-    )
+    response = post_schedule(request)
 
     assert response.status_code == 422
     assert response.json() == {
-        "detail": "AHT seconds must be positive when calls are nonzero."
+        "detail": "History has insufficient prior samples for one or more targets."
     }
-    assert "Traceback" not in response.text
 
 
-def test_schedule_v2_allows_zero_aht_when_all_calls_are_zero():
-    request = load_sample("pipeline-planned-calls-request.json")
-    request["planned_calls"] = [
-        {**item, "calls_per_hour": 0.0} for item in request["planned_calls"]
-    ]
-    request["aht_seconds"] = 0.0
-    request["employees"] = []
-    request["shift_starts"] = []
-
-    response = client.post("/api/schedule-v2", json=request)
-
-    assert response.status_code == 200, response.text
-    result = response.json()
-    assert all(
-        item["erlang"] == {"required_staff": 0, "service_level": None}
-        for item in result["hourly_results"]
+def test_schedule_v2_rejects_legacy_hour_based_payload():
+    response = post_schedule(
+        {
+            "mode": "planned_calls",
+            "week_start": "2026-11-02",
+            "groups": ["sales"],
+            "operating_hours": [{"date": "2026-11-02", "hour": 8}],
+        }
     )
-    assert result["schedule"]["status"] == "OPTIMAL"
+
+    assert response.status_code == 422
+    assert all(
+        item["msg"] == "Invalid value for this field."
+        for item in response.json()["detail"]
+    )
 
 
 def test_schedule_v2_rejects_more_than_50_employees_before_solving():
     request = load_sample("pipeline-planned-calls-request.json")
     employee = request["employees"][0]
     request["employees"] += [
-        {**employee, "id": f"e{index:02}"}
-        for index in range(2, 52)
+        {**employee, "id": f"e{index:02}"} for index in range(2, 52)
     ]
 
-    response = client.post("/api/schedule-v2", json=request)
+    response = post_schedule(request)
 
     assert response.status_code == 422
-    assert any(error["loc"] == ["body", "employees"] for error in response.json()["detail"])
+    assert any(
+        error["loc"] == ["body", "employees"]
+        for error in response.json()["detail"]
+    )
 
 
 @pytest.mark.parametrize(
@@ -318,7 +303,7 @@ def test_schedule_v2_preserves_solver_status_phase_and_warnings(
         status=status,
         assignments=[],
         skill_mismatch_slots=None,
-        total_employee_slots=None,
+        total_shift_minutes=None,
         overstaff_slots=None,
         stage_two_status=stage_two_status,
         warnings=["synthetic solver warning"],
@@ -326,10 +311,7 @@ def test_schedule_v2_preserves_solver_status_phase_and_warnings(
     )
     monkeypatch.setattr(pipeline, "solve_schedule_v2", lambda request: solver_result)
 
-    response = client.post(
-        "/api/schedule-v2",
-        json=load_sample("pipeline-planned-calls-request.json"),
-    )
+    response = post_schedule(load_sample("pipeline-planned-calls-request.json"))
 
     assert response.status_code == 200, response.text
     schedule = response.json()["schedule"]
@@ -339,81 +321,104 @@ def test_schedule_v2_preserves_solver_status_phase_and_warnings(
     assert schedule["message"] == "synthetic solver status"
 
 
-def test_schedule_v2_internal_response_validation_error_returns_500(monkeypatch):
-    marker = "PRIVATE-MARKER-output-validation"
-    request = load_sample("pipeline-planned-calls-request.json")
-    request["groups"] = [marker]
-    request["planned_calls"] = [
-        {**item, "group_id": marker} for item in request["planned_calls"]
-    ]
-    request["employees"][0]["skills"] = [marker]
-    monkeypatch.setattr(pipeline, "solve_schedule_v2", lambda request: None)
+def test_schedule_v2_unexpected_internal_error_remains_500(monkeypatch):
+    marker = "PRIVATE_INTERNAL_MARKER"
 
+    def fail_pipeline(request):
+        raise RuntimeError(marker)
+
+    monkeypatch.setattr(main, "run_pipeline", fail_pipeline)
     response = TestClient(app, raise_server_exceptions=False).post(
-        "/api/schedule-v2", json=request
+        "/api/schedule-v2",
+        json=load_sample("pipeline-planned-calls-request.json"),
     )
 
     assert response.status_code == 500
     assert marker not in response.text
 
 
-def test_schedule_v2_returns_domain_errors_as_422_without_traceback():
+def test_schedule_v2_maps_known_erlang_failure_to_domain_422():
     request = load_sample("pipeline-planned-calls-request.json")
-    request["planned_calls"][0]["calls_per_hour"] = 12.0
+    request["planned_calls"][0]["calls"] = 12.0
+    request["aht_by_group"][0]["aht_seconds"] = 3600.0
     request["max_agents"] = 1
 
-    response = client.post("/api/schedule-v2", json=request)
+    response = post_schedule(request)
 
     assert response.status_code == 422
     assert "max_agents=1" in response.json()["detail"]
     assert "Traceback" not in response.text
 
 
-def test_schedule_v2_sanitizes_insufficient_history_error():
-    marker = "PRIVATE-MARKER-7f2a"
-    request = load_sample("pipeline-history-request.json")
-    request["groups"] = [marker]
-    request["history"] = [
-        {
-            "date": "2026-10-26",
-            "hour": 9,
-            "group_id": marker,
-            "calls": 0,
-        }
-    ]
-    request["employees"][0]["skills"] = [marker]
+def test_schedule_v2_catches_pre_model_assignment_budget_as_domain_422(
+    monkeypatch,
+):
+    monkeypatch.setattr(solver_v2, "MAX_ASSIGNMENT_VARIABLES", 1)
+    request = load_sample("pipeline-planned-calls-request.json")
 
-    response = client.post("/api/schedule-v2", json=request)
+    response = post_schedule(request)
 
     assert response.status_code == 422
     assert response.json() == {
-        "detail": "History has insufficient prior samples for one or more targets."
+        "detail": "The schedule exceeds the prototype assignment-variable limit."
     }
-    assert marker not in response.text
-    assert "input_value" not in response.text
 
 
-def test_schedule_v2_sanitizes_domain_error_but_keeps_safe_limit_context():
-    marker = "PRIVATE-MARKER-7f2a"
-    request = load_sample("pipeline-planned-calls-request.json")
-    request["groups"] = [marker]
-    request["planned_calls"] = [
-        {**item, "group_id": marker} for item in request["planned_calls"]
-    ]
-    request["employees"][0]["skills"] = [marker]
-    request["planned_calls"][0]["calls_per_hour"] = 12.0
-    request["max_agents"] = 1
+def test_schedule_v2_rejects_oversized_actual_body(monkeypatch):
+    monkeypatch.setattr(main, "MAX_SCHEDULE_BODY_BYTES", 2, raising=False)
+    response = client.post(
+        "/api/schedule-v2",
+        content=b"{} ",
+        headers={"Content-Type": "application/json"},
+    )
 
-    response = client.post("/api/schedule-v2", json=request)
+    assert response.status_code == 413
+    assert "size limit" in response.json()["detail"].lower()
 
+
+def test_schedule_v2_counts_streamed_bytes(monkeypatch):
+    monkeypatch.setattr(main, "MAX_SCHEDULE_BODY_BYTES", 4, raising=False)
+    response = client.post(
+        "/api/schedule-v2",
+        content=iter((b'{"x', b'": 1}')),
+        headers={"Content-Type": "application/json"},
+    )
+    assert response.status_code == 413
+
+
+def test_schedule_v2_rejects_lying_content_length(monkeypatch):
+    monkeypatch.setattr(main, "MAX_SCHEDULE_BODY_BYTES", 4, raising=False)
+    response = client.post(
+        "/api/schedule-v2",
+        content=b"{}   ",
+        headers={
+            "Content-Type": "application/json",
+            "Content-Length": "1",
+        },
+    )
+    assert response.status_code == 413
+
+
+def test_schedule_v2_accepts_exact_body_limit(monkeypatch):
+    monkeypatch.setattr(main, "MAX_SCHEDULE_BODY_BYTES", 2, raising=False)
+    response = client.post(
+        "/api/schedule-v2",
+        content=b"{}",
+        headers={"Content-Type": "application/json"},
+    )
     assert response.status_code == 422
-    assert "max_agents=1" in response.json()["detail"]
-    assert marker not in response.text
-    assert "Traceback" not in response.text
 
 
-def test_solver_preview_validation_errors_remain_fastapi_422():
-    response = client.post("/api/solver-preview", json={})
-
-    assert response.status_code == 422
-    assert isinstance(response.json()["detail"], list)
+def test_schedule_v2_openapi_has_interval_schema_and_no_hour_compatibility():
+    schema = client.get("/openapi.json").json()
+    operation = schema["paths"]["/api/schedule-v2"]["post"]
+    request_schema = operation["requestBody"]["content"]["application/json"]["schema"]
+    assert request_schema["type"] == "object"
+    assert {
+        "groups",
+        "operating_intervals",
+        "service_targets",
+        "aht_by_group",
+        "shifts",
+    } <= set(request_schema["properties"])
+    assert "operating_hours" not in request_schema["properties"]

@@ -1,5 +1,6 @@
-"""Internal end-to-end call-volume, Erlang C, and weekly scheduling pipeline."""
+"""Interval demand, Erlang C staffing, and weekly scheduling pipeline."""
 
+from collections import defaultdict
 from datetime import date, datetime, timedelta
 import re
 from typing import Literal
@@ -12,7 +13,6 @@ from pydantic import (
     StrictFloat,
     StrictInt,
     StrictStr,
-    ValidationError,
     field_validator,
     model_validator,
 )
@@ -20,14 +20,16 @@ from pydantic import (
 from .erlang_c import calculate_required_staff
 from .forecast import forecast_calls
 from .models import (
+    CallIntervalObservation,
     ErlangCRequest,
     ErlangCResponse,
     ForecastRequest,
     ForecastResponse,
     ForecastTarget,
-    HourlyCallObservation,
+    HistoryWindow,
+    IntervalForecast,
     MAX_ERLANG_C_AGENTS,
-    validate_aht_for_calls,
+    PlannedCallInterval,
     validate_history_keys_unique,
 )
 from .solver_v2 import (
@@ -36,22 +38,24 @@ from .solver_v2 import (
     MAX_IDENTIFIER_LENGTH,
     MAX_OPERATING_SLOTS,
     MAX_SOLVE_SECONDS,
-    MAX_SHIFT_STARTS,
+    MAX_SHIFT_CANDIDATES,
     EmployeeV2,
+    OperatingInterval,
     OperatingSlot,
-    ShiftStart,
+    ShiftAssignment,
+    ShiftOption,
     SlotRequirement,
     SolverV2Request,
     SolverV2Response,
+    SolverModelSizeError,
     solve_schedule_v2,
     validate_solver_configuration,
 )
 
 
 MAX_WEEK_DAYS = 7
-MAX_HOURLY_SLOTS = min(MAX_WEEK_DAYS * 23, MAX_OPERATING_SLOTS // 2)
 MAX_HISTORY_ROWS = 100_000
-MAX_HOURLY_CALL_ROWS = MAX_HOURLY_SLOTS * MAX_GROUPS
+MAX_INTERVAL_ROWS = MAX_OPERATING_SLOTS * MAX_GROUPS
 DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
@@ -80,113 +84,85 @@ class _StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
 
-class PipelineOperatingHour(_StrictModel):
-    date: date
-    hour: StrictInt
+class PipelineGroup(_StrictModel):
+    id: StrictStr
+    name: StrictStr
 
-    @field_validator("date", mode="before")
+    @field_validator("id", "name")
     @classmethod
-    def date_is_iso(cls, value: object) -> date:
-        return _parse_date(value)
-
-    @field_validator("hour")
-    @classmethod
-    def hour_is_supported(cls, value: int) -> int:
-        if value == 23:
-            raise ValueError(
-                "hour 23 is unsupported because solver v2 cannot represent "
-                "the required 23:30 slot"
-            )
-        if not 0 <= value <= 22:
-            raise ValueError("hour must be an integer from 0 through 22")
+    def text_is_bounded(cls, value: str) -> str:
+        value = value.strip()
+        if not value or len(value) > MAX_IDENTIFIER_LENGTH:
+            raise ValueError("group id and name must be non-empty and bounded")
         return value
 
 
-class PipelineHistoryObservation(HourlyCallObservation):
-    model_config = ConfigDict(extra="forbid", strict=True)
-
-    @field_validator("date", mode="before")
-    @classmethod
-    def date_is_iso(cls, value: object) -> date:
-        return _parse_date(value)
+class PipelineServiceTarget(_StrictModel):
+    group_id: StrictStr
+    target_sla: StrictFloat = Field(gt=0, lt=1, allow_inf_nan=False)
+    waiting_seconds: StrictFloat = Field(ge=0, allow_inf_nan=False)
 
     @field_validator("group_id")
     @classmethod
     def group_id_is_bounded(cls, value: str) -> str:
         value = value.strip()
-        if not value:
-            raise ValueError("group id must not be empty")
-        if len(value) > MAX_IDENTIFIER_LENGTH:
-            raise ValueError(
-                f"group id must be at most {MAX_IDENTIFIER_LENGTH} characters"
-            )
+        if not value or len(value) > MAX_IDENTIFIER_LENGTH:
+            raise ValueError("group id must be non-empty and bounded")
         return value
 
 
-class PipelinePlannedCalls(PipelineOperatingHour):
+class PipelineAHTSummary(_StrictModel):
     group_id: StrictStr
-    calls_per_hour: StrictFloat = Field(ge=0, allow_inf_nan=False)
+    aht_seconds: StrictFloat = Field(gt=0, allow_inf_nan=False)
+    sample_count: StrictInt = Field(ge=1)
+    cutoff_before: date
 
     @field_validator("group_id")
     @classmethod
-    def group_id_is_normalized(cls, value: str) -> str:
+    def group_id_is_bounded(cls, value: str) -> str:
         value = value.strip()
-        if not value:
-            raise ValueError("group id must not be empty")
-        if len(value) > MAX_IDENTIFIER_LENGTH:
-            raise ValueError(
-                f"group id must be at most {MAX_IDENTIFIER_LENGTH} characters"
-            )
+        if not value or len(value) > MAX_IDENTIFIER_LENGTH:
+            raise ValueError("group id must be non-empty and bounded")
         return value
+
+    @field_validator("cutoff_before", mode="before")
+    @classmethod
+    def cutoff_is_iso(cls, value: object) -> date:
+        return _parse_date(value)
 
 
 class PipelineRequest(_StrictModel):
     mode: Literal["history", "planned_calls"]
     week_start: date
-    groups: list[StrictStr] = Field(min_length=1, max_length=MAX_GROUPS)
-    operating_hours: list[PipelineOperatingHour] = Field(
-        min_length=1, max_length=MAX_HOURLY_SLOTS
+    groups: list[PipelineGroup] = Field(min_length=1, max_length=MAX_GROUPS)
+    operating_intervals: list[OperatingInterval] = Field(
+        min_length=1, max_length=MAX_OPERATING_SLOTS
     )
     employees: list[EmployeeV2] = Field(max_length=MAX_EMPLOYEES)
-    shift_starts: list[ShiftStart] = Field(max_length=MAX_SHIFT_STARTS)
+    shifts: list[ShiftOption] = Field(max_length=MAX_SHIFT_CANDIDATES)
+    service_targets: list[PipelineServiceTarget] = Field(
+        min_length=1, max_length=MAX_GROUPS
+    )
+    aht_by_group: list[PipelineAHTSummary] = Field(max_length=MAX_GROUPS)
     allow_skill_fallback: StrictBool = False
     max_solve_seconds: StrictInt = Field(default=10, ge=1, le=MAX_SOLVE_SECONDS)
-    aht_seconds: StrictFloat = Field(ge=0, allow_inf_nan=False)
-    target_sla: StrictFloat = Field(gt=0, lt=1, allow_inf_nan=False)
-    waiting_seconds: StrictFloat = Field(ge=0, allow_inf_nan=False)
     max_agents: StrictInt = Field(
         default=MAX_ERLANG_C_AGENTS,
         ge=1,
         le=MAX_ERLANG_C_AGENTS,
     )
-    history: list[PipelineHistoryObservation] | None = Field(
+    history_window: HistoryWindow | None = None
+    history: list[CallIntervalObservation] | None = Field(
         default=None, max_length=MAX_HISTORY_ROWS
     )
-    planned_calls: list[PipelinePlannedCalls] | None = Field(
-        default=None, max_length=MAX_HOURLY_CALL_ROWS
+    planned_calls: list[PlannedCallInterval] | None = Field(
+        default=None, max_length=MAX_INTERVAL_ROWS
     )
 
     @field_validator("week_start", mode="before")
     @classmethod
     def week_start_is_iso(cls, value: object) -> date:
         return _parse_date(value)
-
-    @field_validator("groups")
-    @classmethod
-    def groups_are_normalized(cls, values: list[str]) -> list[str]:
-        normalized = []
-        for value in values:
-            value = value.strip()
-            if not value:
-                raise ValueError("group id must not be empty")
-            if len(value) > MAX_IDENTIFIER_LENGTH:
-                raise ValueError(
-                    f"group id must be at most {MAX_IDENTIFIER_LENGTH} characters"
-                )
-            normalized.append(value)
-        if len(normalized) != len(set(normalized)):
-            raise ValueError("group ids must be unique")
-        return normalized
 
     @model_validator(mode="after")
     def pipeline_inputs_are_consistent(self) -> "PipelineRequest":
@@ -200,177 +176,232 @@ class PipelineRequest(_StrictModel):
         except OverflowError as error:
             raise ValueError("declared week exceeds the supported date range") from error
 
-        hour_keys = [(item.date, item.hour) for item in self.operating_hours]
-        if len(hour_keys) != len(set(hour_keys)):
-            raise ValueError("operating hours must be unique")
-        if any(day not in week_dates for day, _ in hour_keys):
-            raise ValueError("operating hours must be within the declared week")
+        group_ids = [group.id for group in self.groups]
+        if len(group_ids) != len(set(group_ids)):
+            raise ValueError("group ids must be unique")
+        group_set = set(group_ids)
 
-        hours_by_day: dict[date, list[int]] = {}
-        for day, hour in hour_keys:
-            hours_by_day.setdefault(day, []).append(hour)
-        for hours in hours_by_day.values():
-            ordered_hours = sorted(hours)
-            if ordered_hours != list(range(ordered_hours[0], ordered_hours[-1] + 1)):
-                raise ValueError("operating hours must be contiguous within each date")
+        service_group_ids = [item.group_id for item in self.service_targets]
+        if len(service_group_ids) != len(set(service_group_ids)):
+            raise ValueError("service targets must be unique by group")
+        if set(service_group_ids) != group_set:
+            raise ValueError("every declared group needs exactly one service target")
 
-        if self.history is not None:
-            validate_history_keys_unique(self.history)
+        aht_group_ids = [item.group_id for item in self.aht_by_group]
+        if len(aht_group_ids) != len(set(aht_group_ids)):
+            raise ValueError("AHT summaries must be unique by group")
+        if not set(aht_group_ids) <= group_set:
+            raise ValueError("AHT summaries must use declared groups")
+        if any(item.cutoff_before > self.week_start for item in self.aht_by_group):
+            raise ValueError("AHT cutoff_before must not be after week_start")
 
-        operating_slots = [
-            OperatingSlot(date=item.date, start=start)
-            for item in self.operating_hours
-            for start in (f"{item.hour:02d}:00", f"{item.hour:02d}:30")
-        ]
+        operating_intervals = sorted(
+            self.operating_intervals,
+            key=lambda item: (item.date, item.start, item.end),
+        )
+        previous_end: dict[date, int] = {}
+        operating_slots = []
+        for interval in operating_intervals:
+            if interval.date not in week_dates:
+                raise ValueError("operating intervals must be within the declared week")
+            start = _time_minutes(interval.start)
+            end = _time_minutes(interval.end)
+            if start < previous_end.get(interval.date, -1):
+                raise ValueError("operating intervals must not overlap")
+            previous_end[interval.date] = end
+            for minute in range(start, end, 30):
+                operating_slots.append(
+                    OperatingSlot(
+                        date=interval.date,
+                        start="24:00" if minute == 1440 else f"{minute // 60:02d}:{minute % 60:02d}",
+                    )
+                )
+                if len(operating_slots) > MAX_OPERATING_SLOTS:
+                    raise ValueError(
+                        f"operating slots exceed {MAX_OPERATING_SLOTS}"
+                    )
+
         validate_solver_configuration(
             self.week_start,
-            self.groups,
+            group_ids,
             operating_slots,
             self.employees,
-            self.shift_starts,
+            self.shifts,
         )
 
         if self.mode == "history":
-            if not self.history:
-                raise ValueError("history mode requires non-empty history")
+            if not self.history or self.history_window is None:
+                raise ValueError("history mode requires history and history_window")
             if self.planned_calls is not None:
                 raise ValueError("history mode must not include planned_calls")
-            if any(point.date >= self.week_start for point in self.history):
+            if self.history_window.end_date > self.week_start:
+                raise ValueError("history_window must end no later than week_start")
+            if any(item.group_id not in group_set for item in self.history):
+                raise ValueError("history must use declared groups")
+            validate_history_keys_unique(self.history)
+            if any(
+                not self.history_window.start_date
+                <= item.date
+                < self.history_window.end_date
+                or item.date >= self.week_start
+                for item in self.history
+            ):
                 raise ValueError(
-                    "history dates must be before week_start to prevent forecast leakage"
+                    "history rows must be inside history_window and before week_start"
                 )
             return self
 
-        if self.history is not None:
-            raise ValueError("planned_calls mode must not include history")
+        if self.history is not None or self.history_window is not None:
+            raise ValueError("planned_calls mode must not include history fields")
         if not self.planned_calls:
             raise ValueError("planned_calls mode requires non-empty planned_calls")
 
         expected = {
-            (item.date, item.hour, group)
-            for item in self.operating_hours
-            for group in self.groups
+            (slot.date, slot.start, group) for slot in operating_slots for group in group_ids
         }
-        actual_keys = [
-            (item.date, item.hour, item.group_id) for item in self.planned_calls
+        actual = [
+            (row.date, row.start, row.group_id) for row in self.planned_calls
         ]
-        if len(actual_keys) != len(set(actual_keys)):
-            raise ValueError("planned_calls date/hour/group rows must be unique")
-        if any(day not in week_dates for day, _, _ in actual_keys):
-            raise ValueError("planned_calls must be within the declared week")
-        if any(group not in self.groups for _, _, group in actual_keys):
+        if len(actual) != len(set(actual)):
+            raise ValueError("planned_calls date/start/group rows must be unique")
+        if any(group not in group_set for _, _, group in actual):
             raise ValueError("planned_calls must use declared groups")
-        if set(actual_keys) != expected:
-            missing = len(expected - set(actual_keys))
-            extra = len(set(actual_keys) - expected)
+        if set(actual) != expected:
             raise ValueError(
-                "planned_calls must contain exactly one row for every "
-                f"operating hour/group (missing={missing}, extra={extra}); "
-                "zero calls must be explicit"
+                "planned_calls must contain exactly one explicit row for every "
+                "operating slot/group, including zero calls"
             )
         return self
 
 
-class PipelineHourlyResult(_StrictModel):
+def _time_minutes(value: str) -> int:
+    if value == "24:00":
+        return 24 * 60
+    hour, minute = map(int, value.split(":"))
+    return hour * 60 + minute
+
+
+class PipelineIntervalResult(_StrictModel):
     date: date
-    hour: StrictInt
+    start: StrictStr
     group_id: StrictStr
-    calls_per_hour: StrictFloat
+    calls: StrictFloat = Field(ge=0, allow_inf_nan=False)
     sample_count: StrictInt | None
     erlang: ErlangCResponse
+    assigned_staff: StrictInt | None
 
 
 class PipelineResponse(_StrictModel):
     mode: Literal["history", "planned_calls"]
     forecast: ForecastResponse | None
-    hourly_results: list[PipelineHourlyResult]
-    requirements: list[SlotRequirement]
+    groups: list[PipelineGroup]
+    interval_results: list[PipelineIntervalResult]
     schedule: SolverV2Response
 
 
+def _operating_slots(request: PipelineRequest) -> list[OperatingSlot]:
+    slots = []
+    for interval in request.operating_intervals:
+        start = _time_minutes(interval.start)
+        end = _time_minutes(interval.end)
+        for minute in range(start, end, 30):
+            slots.append(
+                OperatingSlot(
+                    date=interval.date,
+                    start="24:00" if minute == 1440 else f"{minute // 60:02d}:{minute % 60:02d}",
+                )
+            )
+    return sorted(slots, key=lambda item: (item.date, item.start))
+
+
+def _staffed_by_slot(
+    schedule: SolverV2Response,
+) -> dict[tuple[date, str, str], int] | None:
+    if schedule.status not in ("OPTIMAL", "FEASIBLE"):
+        return None
+    staffed: dict[tuple[date, str, str], int] = defaultdict(int)
+    for assignment in schedule.assignments:
+        for item in assignment.groups_by_slot:
+            staffed[(assignment.date, item.start, item.group_id)] += 1
+    return staffed
+
+
 def run_pipeline(request: PipelineRequest) -> PipelineResponse:
-    """Run the selected hourly demand source through Erlang C and solver v2."""
+    """Run validated interval demand through Erlang C and solver v2."""
+    groups_by_id = {group.id: group for group in request.groups}
+    service_by_group = {item.group_id: item for item in request.service_targets}
+    aht_by_group = {item.group_id: item for item in request.aht_by_group}
+    operating_slots = _operating_slots(request)
+
     forecast = None
     if request.mode == "history":
         targets = [
-            ForecastTarget(date=item.date, hour=item.hour, group_id=group)
-            for item in request.operating_hours
-            for group in request.groups
+            ForecastTarget(date=slot.date, start=slot.start, group_id=group_id)
+            for slot in operating_slots
+            for group_id in groups_by_id
         ]
-        try:
-            forecast_request = ForecastRequest(history=request.history, targets=targets)
-        except ValidationError as error:
-            errors = error.errors(include_input=False, include_context=False)
-            if (
-                error.title == "ForecastRequest"
-                and len(errors) == 1
-                and errors[0]["type"] == "value_error"
-                and errors[0]["loc"] == ()
-                and errors[0]["msg"]
-                == (
-                    "Value error, each target needs at least two prior "
-                    "same weekday/hour/group samples"
-                )
-            ):
-                raise PipelineDomainError(
-                    "history lacks enough matching samples for forecast targets",
-                    public_message=(
-                        "History has insufficient prior samples for one or more "
-                        "targets."
-                    ),
-                ) from None
-            raise
-        forecast = forecast_calls(forecast_request)
-        hourly_calls = [
-            (
-                item.date,
-                item.hour,
-                item.group_id,
-                item.forecast_calls,
-                item.sample_count,
+        observed_dates: dict[tuple[int, str, str], set[date]] = defaultdict(set)
+        for point in request.history:
+            observed_dates[
+                (point.date.weekday(), point.start, point.group_id)
+            ].add(point.date)
+        if any(
+            len(observed_dates[(target.date.weekday(), target.start, target.group_id)])
+            < 2
+            for target in targets
+        ):
+            raise PipelineDomainError(
+                "history lacks two distinct prior dates for a forecast target",
+                public_message=(
+                    "History has insufficient prior samples for one or more targets."
+                ),
             )
+        forecast_request = ForecastRequest(
+            history_window=request.history_window,
+            history=request.history,
+            targets=targets,
+        )
+        forecast = forecast_calls(forecast_request)
+        demand_rows = [
+            (item.date, item.start, item.group_id, item.forecast_calls, item.sample_count)
             for item in forecast.forecasts
         ]
     else:
-        hourly_calls = [
-            (
-                item.date,
-                item.hour,
-                item.group_id,
-                float(item.calls_per_hour),
-                None,
-            )
+        demand_rows = [
+            (item.date, item.start, item.group_id, float(item.calls), None)
             for item in sorted(
                 request.planned_calls,
-                key=lambda row: (row.date, row.hour, row.group_id),
+                key=lambda row: (row.date, row.start, row.group_id),
             )
         ]
 
-    hourly_results = []
-    for day, hour, group_id, calls, sample_count in hourly_calls:
-        try:
-            validate_aht_for_calls(calls, request.aht_seconds)
-        except ValueError as error:
+    interval_results = []
+    requirements = []
+    for day, start, group_id, calls, sample_count in demand_rows:
+        aht_summary = aht_by_group.get(group_id)
+        if calls > 0 and aht_summary is None:
             raise PipelineDomainError(
-                str(error),
-                public_message="AHT seconds must be positive when calls are nonzero.",
-            ) from error
+                f"AHT summary missing for positive-call group {group_id!r}",
+                public_message=(
+                    "AHT seconds are required for groups with positive calls."
+                ),
+            )
+        service = service_by_group[group_id]
+        aht_seconds = aht_summary.aht_seconds if aht_summary is not None else 0.0
         try:
             erlang = calculate_required_staff(
                 ErlangCRequest(
-                    calls_per_hour=calls,
-                    aht_seconds=request.aht_seconds,
-                    target_sla=request.target_sla,
-                    waiting_seconds=request.waiting_seconds,
+                    calls_per_hour=2 * calls,
+                    aht_seconds=aht_seconds,
+                    target_sla=service.target_sla,
+                    waiting_seconds=service.waiting_seconds,
                     max_agents=request.max_agents,
                 )
             )
-        except ValidationError:
-            raise
         except ValueError as error:
             raise PipelineDomainError(
-                f"Erlang C failed for {day.isoformat()} {hour:02d}:00 "
-                f"group {group_id!r}: {error}",
+                f"Erlang C failed for {day.isoformat()} {start} group "
+                f"{group_id!r}: {error}",
                 public_message=(
                     "Erlang C could not meet the staffing target within "
                     f"max_agents={request.max_agents}."
@@ -379,56 +410,64 @@ def run_pipeline(request: PipelineRequest) -> PipelineResponse:
         if erlang.required_staff > MAX_EMPLOYEES:
             raise PipelineDomainError(
                 f"Erlang C requires {erlang.required_staff} agents for "
-                f"{day.isoformat()} {hour:02d}:00 group {group_id!r}, "
-                f"exceeding solver v2's per-slot limit of {MAX_EMPLOYEES}",
+                f"{day.isoformat()} {start} group {group_id!r}, exceeding "
+                f"the solver limit of {MAX_EMPLOYEES}",
                 public_message=(
                     "Erlang C staffing exceeds the solver v2 limit of "
                     f"{MAX_EMPLOYEES} employees per group/slot."
                 ),
             )
-        hourly_results.append(
-            PipelineHourlyResult(
+        interval_results.append(
+            PipelineIntervalResult(
                 date=day,
-                hour=hour,
+                start=start,
                 group_id=group_id,
-                calls_per_hour=calls,
+                calls=float(calls),
                 sample_count=sample_count,
                 erlang=erlang,
+                assigned_staff=None,
+            )
+        )
+        requirements.append(
+            SlotRequirement(
+                date=day,
+                start=start,
+                group_id=group_id,
+                required_staff=erlang.required_staff,
             )
         )
 
-    operating_slots = [
-        OperatingSlot(date=item.date, start=start)
-        for item in sorted(request.operating_hours, key=lambda row: (row.date, row.hour))
-        for start in (f"{item.hour:02d}:00", f"{item.hour:02d}:30")
-    ]
-    requirements = [
-        SlotRequirement(
-            date=result.date,
-            start=start,
-            group_id=result.group_id,
-            required_staff=result.erlang.required_staff,
-        )
-        for result in hourly_results
-        for start in (f"{result.hour:02d}:00", f"{result.hour:02d}:30")
-    ]
     solver_request = SolverV2Request.model_validate(
         {
             "week_start": request.week_start,
-            "groups": request.groups,
+            "groups": list(groups_by_id),
             "operating_slots": operating_slots,
             "requirements": requirements,
             "employees": request.employees,
-            "shift_starts": request.shift_starts,
+            "shifts": request.shifts,
             "allow_skill_fallback": request.allow_skill_fallback,
             "max_solve_seconds": request.max_solve_seconds,
         }
     )
-    schedule = solve_schedule_v2(solver_request)
+    try:
+        schedule = solve_schedule_v2(solver_request)
+    except SolverModelSizeError as error:
+        raise PipelineDomainError(
+            str(error),
+            public_message="The schedule exceeds the prototype assignment-variable limit.",
+        ) from None
+
+    staffed = _staffed_by_slot(schedule)
+    if staffed is not None:
+        for result in interval_results:
+            result.assigned_staff = staffed.get(
+                (result.date, result.start, result.group_id), 0
+            )
+
     return PipelineResponse(
         mode=request.mode,
         forecast=forecast,
-        hourly_results=hourly_results,
-        requirements=requirements,
+        groups=list(request.groups),
+        interval_results=interval_results,
         schedule=schedule,
     )

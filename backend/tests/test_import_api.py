@@ -11,11 +11,11 @@ import pytest
 from backend.app import import_calls, main
 from backend.app.import_calls import CallImportError
 from backend.app.main import app
-from backend.app.pipeline import PipelineHistoryObservation
+from backend.app.models import CallIntervalObservation
 
 
 client = TestClient(app)
-HEADER = ("date", "hour", "group_id", "calls")
+HEADER = ("date", "start", "group_id", "calls")
 XLSX_CONTENT_TYPE = (
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 )
@@ -79,17 +79,17 @@ def add_zip_entries(data, entries, *, compression=zipfile.ZIP_DEFLATED):
     [
         (
             "history",
-            ("2026-10-05", 8, "sales", 0),
-            {"date": "2026-10-05", "hour": 8, "group_id": "sales", "calls": 0},
+            ("2026-10-05", "08:00", "sales", 0),
+            {"date": "2026-10-05", "start": "08:00", "group_id": "sales", "calls": 0},
         ),
         (
             "planned_calls",
-            ("2026-11-02", 8, "sales", 0),
+            ("2026-11-02", "08:00", "sales", 0),
             {
                 "date": "2026-11-02",
-                "hour": 8,
+                "start": "08:00",
                 "group_id": "sales",
-                "calls_per_hour": 0.0,
+                "calls": 0.0,
             },
         ),
     ],
@@ -107,7 +107,7 @@ def test_import_csv_returns_mode_specific_rows_and_preserves_zero(
 
 def test_import_xlsx_returns_planned_rows_with_iso_dates():
     response = post_import(
-        xlsx_bytes([HEADER, [date(2026, 11, 2), 8, "sales", 2.5]]),
+        xlsx_bytes([HEADER, [date(2026, 11, 2), "08:00", "sales", 2.5]]),
         file_format="xlsx",
         headers={"Content-Type": XLSX_CONTENT_TYPE},
     )
@@ -118,9 +118,9 @@ def test_import_xlsx_returns_planned_rows_with_iso_dates():
         "rows": [
             {
                 "date": "2026-11-02",
-                "hour": 8,
+                "start": "08:00",
                 "group_id": "sales",
-                "calls_per_hour": 2.5,
+                "calls": 2.5,
             }
         ],
     }
@@ -150,7 +150,7 @@ def test_import_rejects_unsupported_or_mismatched_media_types(
 
 def test_import_rejects_unsupported_content_encoding():
     response = post_import(
-        csv_bytes(("2026-11-02", 8, "sales", 1)),
+        csv_bytes(("2026-11-02", "08:00", "sales", 1)),
         headers={
             "Content-Type": "application/octet-stream",
             "Content-Encoding": "gzip",
@@ -163,7 +163,7 @@ def test_import_rejects_unsupported_content_encoding():
 def test_import_rejects_more_than_ten_repeated_groups_without_echoing_values():
     marker = "PRIVATE_GROUP_MARKER"
     response = post_import(
-        csv_bytes(("2026-11-02", 8, "sales", 1)),
+        csv_bytes(("2026-11-02", "08:00", "sales", 1)),
         groups=(marker,) * 11,
     )
 
@@ -177,7 +177,7 @@ def test_import_rejects_more_than_ten_repeated_groups_without_echoing_values():
 
 def test_import_rejects_duplicate_groups_safely():
     response = post_import(
-        csv_bytes(("2026-11-02", 8, "sales", 1)),
+        csv_bytes(("2026-11-02", "08:00", "sales", 1)),
         groups=("sales", "sales"),
     )
 
@@ -188,9 +188,9 @@ def test_import_rejects_duplicate_groups_safely():
 @pytest.mark.parametrize(
     "data",
     [
-        b"PRIVATE_HEADER_MARKER,hour,group_id,calls\n2026-11-02,8,sales,1\n",
-        b"date,hour,group_id,calls\n2026-11-02,8,sales,\n",
-        b"date,hour,group_id,calls\n2026-11-02,8,PRIVATE_GROUP_MARKER,1\n",
+        b"PRIVATE_HEADER_MARKER,start,group_id,calls\n2026-11-02,08:00,sales,1\n",
+        b"date,start,group_id,calls\n2026-11-02,8,sales,\n",
+        b"date,start,group_id,calls\n2026-11-02,8,PRIVATE_GROUP_MARKER,1\n",
         b"\xffPRIVATE_INVALID_CSV",
     ],
 )
@@ -206,7 +206,7 @@ def test_import_rejects_formula_workbook_without_echoing_cell_contents():
     marker = "=PRIVATE_FORMULA_MARKER"
     response = post_import(
         xlsx_bytes(
-            [HEADER, ["2026-11-02", 8, "sales", 1]],
+            [HEADER, ["2026-11-02", "08:00", "sales", 1]],
             formula=("D2", marker),
         ),
         file_format="xlsx",
@@ -221,7 +221,7 @@ def test_import_rejects_formula_workbook_without_echoing_cell_contents():
 def test_import_rejects_xlsx_xml_limit_before_openpyxl(monkeypatch):
     xml_part = b"<root>" + b"<item/>" * 4_000 + b"</root>"
     data = add_zip_entries(
-        xlsx_bytes([HEADER, ["2026-11-02", 8, "sales", 1]]),
+        xlsx_bytes([HEADER, ["2026-11-02", "08:00", "sales", 1]]),
         [
             (f"docProps/extra{index}.xml", xml_part)
             for index in range(38)
@@ -251,7 +251,7 @@ def test_import_uses_actual_stream_size_not_untrusted_small_content_length(monke
 
     monkeypatch.setattr(main, "parse_calls_import", unexpected_parser_call)
     response = post_import(
-        b"x" * (import_calls.MAX_FILE_BYTES + 1),
+        b"x" * (main.MAX_UPLOAD_BYTES + 1),
         headers={
             "Content-Type": "application/octet-stream",
             "Content-Length": "1",
@@ -272,10 +272,10 @@ def test_import_uses_valid_oversized_content_length_as_an_early_reject(monkeypat
 
     monkeypatch.setattr(main, "parse_calls_import", unexpected_parser_call)
     response = post_import(
-        csv_bytes(("2026-11-02", 8, "sales", 1)),
+        csv_bytes(("2026-11-02", "08:00", "sales", 1)),
         headers={
             "Content-Type": "application/octet-stream",
-            "Content-Length": str(import_calls.MAX_FILE_BYTES + 1),
+            "Content-Length": str(main.MAX_UPLOAD_BYTES + 1),
         },
     )
 
@@ -285,7 +285,7 @@ def test_import_uses_valid_oversized_content_length_as_an_early_reject(monkeypat
 
 def test_import_ignores_malformed_content_length_and_still_parses_stream():
     response = post_import(
-        csv_bytes(("2026-11-02", 8, "sales", 1)),
+        csv_bytes(("2026-11-02", "08:00", "sales", 1)),
         headers={
             "Content-Type": "application/octet-stream",
             "Content-Length": "not-a-number",
@@ -313,10 +313,15 @@ def test_import_sanitizes_missing_or_invalid_query_values(params):
     assert response.status_code == 422
     assert "private_" not in response.text.lower()
     assert "PRIVATE_BODY_MARKER" not in response.text
-    assert all(
-        item["msg"] == "Invalid value for this field."
-        for item in response.json()["detail"]
-    )
+    if params.endswith("mode=history"):
+        assert response.json() == {
+            "detail": "group_id is required for CSV/XLSX."
+        }
+    else:
+        assert all(
+            item["msg"] == "Invalid value for this field."
+            for item in response.json()["detail"]
+        )
 
 
 def test_import_maps_only_call_import_errors_to_422(monkeypatch):
@@ -327,7 +332,7 @@ def test_import_maps_only_call_import_errors_to_422(monkeypatch):
 
     monkeypatch.setattr(main, "parse_calls_import", reject_import)
 
-    response = post_import(csv_bytes(("2026-11-02", 8, "sales", 1)))
+    response = post_import(csv_bytes(("2026-11-02", "08:00", "sales", 1)))
 
     assert response.status_code == 422
     assert response.json() == {"detail": marker}
@@ -344,7 +349,7 @@ def test_import_does_not_disguise_unexpected_parser_errors_as_422(monkeypatch):
     response = TestClient(app, raise_server_exceptions=False).post(
         "/api/calls/import",
         params=query(),
-        content=csv_bytes(("2026-11-02", 8, "sales", 1)),
+        content=csv_bytes(("2026-11-02", "08:00", "sales", 1)),
         headers={"Content-Type": "application/octet-stream"},
     )
 
@@ -362,14 +367,14 @@ def test_import_parse_semaphore_is_released_after_success_or_parser_error(
         if raises:
             raise CallImportError("invalid file")
         return [
-            PipelineHistoryObservation(
-                date=date(2026, 10, 5), hour=8, group_id="sales", calls=0
+            CallIntervalObservation(
+                date=date(2026, 10, 5), start="08:00", group_id="sales", calls=0
             )
         ]
 
     monkeypatch.setattr(main, "parse_calls_import", parser)
     response = post_import(
-        csv_bytes(("2026-10-05", 8, "sales", 0)),
+        csv_bytes(("2026-10-05", "08:00", "sales", 0)),
         mode="history",
     )
 
@@ -389,7 +394,7 @@ def test_import_returns_429_when_process_parse_slot_is_busy(monkeypatch):
     monkeypatch.setattr(main, "parse_calls_import", unexpected_parser_call)
     assert main._CALL_IMPORT_SEMAPHORE.acquire(blocking=False)
     try:
-        response = post_import(csv_bytes(("2026-11-02", 8, "sales", 1)))
+        response = post_import(csv_bytes(("2026-11-02", "08:00", "sales", 1)))
     finally:
         main._CALL_IMPORT_SEMAPHORE.release()
 
@@ -414,7 +419,7 @@ def test_import_runs_parser_off_the_async_request_thread(monkeypatch):
 
     monkeypatch.setattr(main, "run_in_threadpool", record_threadpool_thread)
     monkeypatch.setattr(main, "parse_calls_import", record_parser_thread)
-    response = post_import(csv_bytes(("2026-11-02", 8, "sales", 1)))
+    response = post_import(csv_bytes(("2026-11-02", "08:00", "sales", 1)))
 
     assert response.status_code == 200
     assert event_loop_thread and parser_thread
@@ -426,11 +431,19 @@ def test_import_openapi_documents_a_binary_body_and_repeated_group_query():
     operation = schema["paths"]["/api/calls/import"]["post"]
 
     media = operation["requestBody"]["content"]
-    assert set(media) == {"application/octet-stream", "text/csv", XLSX_CONTENT_TYPE}
+    assert set(media) == {
+        "application/octet-stream",
+        "text/csv",
+        XLSX_CONTENT_TYPE,
+        "application/zip",
+    }
     assert all(
         item["schema"] == {"type": "string", "format": "binary"}
         for item in media.values()
     )
     group = next(item for item in operation["parameters"] if item["name"] == "group_id")
     assert group["in"] == "query"
-    assert group["schema"]["maxItems"] == 10
+    assert any(
+        item.get("maxItems") == 10
+        for item in group["schema"]["anyOf"]
+    )

@@ -1,17 +1,18 @@
-"""Spreadsheet-safe CSV rendering for existing pipeline results."""
+"""Spreadsheet-safe CSV rendering for interval pipeline results."""
 
 import csv
 import io
 import unicodedata
 from datetime import date, datetime
 
+from pydantic import ValidationError
+
 from .pipeline import PipelineResponse
 from .solver_v2 import (
     MAX_EMPLOYEES,
     MAX_IDENTIFIER_LENGTH,
-    MAX_SHIFT_STARTS,
+    MAX_SHIFT_CANDIDATES,
     ShiftAssignment,
-    SlotGroupAssignment,
     SolverV2Response,
 )
 
@@ -19,16 +20,21 @@ from .solver_v2 import (
 HEADERS = (
     "Mã nhân viên",
     "Ngày",
-    "Bắt đầu ca",
-    "Kết thúc ca",
     "Bắt đầu khoảng",
     "Kết thúc khoảng",
-    "Nhóm phục vụ",
+    "Mã nhóm",
+    "Tên nhóm",
+    "Bắt đầu ca",
+    "Kết thúc ca",
+    "Nghỉ trong ca",
+    "Thời lượng ca (phút)",
 )
 _FORMULA_MARKERS = ("=", "+", "-", "@")
 
 
 def _minutes(value: str) -> int:
+    if value == "24:00":
+        return 24 * 60
     if (
         not isinstance(value, str)
         or len(value) != 5
@@ -37,13 +43,15 @@ def _minutes(value: str) -> int:
     ):
         raise ValueError("malformed schedule time")
     hour, minute = int(value[:2]), int(value[3:])
-    if hour > 23 or minute > 59:
+    if hour > 23 or minute not in (0, 30):
         raise ValueError("malformed schedule time")
     return hour * 60 + minute
 
 
 def _time_text(minutes: int) -> str:
-    return f"{minutes // 60:02d}:{minutes % 60:02d}"
+    if not 0 <= minutes <= 24 * 60:
+        raise ValueError("malformed schedule time")
+    return "24:00" if minutes == 24 * 60 else f"{minutes // 60:02d}:{minutes % 60:02d}"
 
 
 def _excel_safe(value: str) -> str:
@@ -65,43 +73,35 @@ def _excel_safe(value: str) -> str:
     has_leading_control = any(
         ord(char) < 32 or 127 <= ord(char) < 160 for char in value[:index]
     )
-    # Normalize only for detection; keep the original text in the CSV cell.
     marker = unicodedata.normalize("NFKC", value[index : index + 1])
     if has_leading_control or marker in _FORMULA_MARKERS:
         return "'" + value
     return value
 
 
-def _validate_assignment(assignment: ShiftAssignment) -> int:
+def _validate_assignment(assignment: ShiftAssignment) -> tuple[int, int]:
     if not isinstance(assignment, ShiftAssignment):
         raise ValueError("malformed schedule assignment")
+    try:
+        assignment = ShiftAssignment.model_validate(assignment.model_dump())
+    except ValidationError:
+        raise ValueError("malformed schedule assignment") from None
     if (
         not isinstance(assignment.employee_id, str)
         or not assignment.employee_id.strip()
         or len(assignment.employee_id) > MAX_IDENTIFIER_LENGTH
         or isinstance(assignment.date, datetime)
         or not isinstance(assignment.date, date)
-        or not isinstance(assignment.groups_by_slot, list)
-        or len(assignment.groups_by_slot) != 3
     ):
         raise ValueError("malformed schedule assignment")
-
-    shift_start = _minutes(assignment.start)
-    if shift_start % 30 or shift_start > 22 * 60:
+    start = _minutes(assignment.start)
+    end = _minutes(assignment.end)
+    if start >= end or end - start > 24 * 60:
         raise ValueError("malformed schedule assignment")
-    if _minutes(assignment.end) != shift_start + 90:
-        raise ValueError("malformed schedule assignment")
-    for offset, slot in enumerate(assignment.groups_by_slot):
-        if not isinstance(slot, SlotGroupAssignment):
+    for item in assignment.breaks:
+        if _minutes(item.start) < start or _minutes(item.end) > end:
             raise ValueError("malformed schedule assignment")
-        if (
-            _minutes(slot.start) != shift_start + 30 * offset
-            or not isinstance(slot.group_id, str)
-            or not slot.group_id.strip()
-            or len(slot.group_id) > MAX_IDENTIFIER_LENGTH
-        ):
-            raise ValueError("malformed schedule assignment")
-    return shift_start
+    return start, end - start
 
 
 def pipeline_to_csv(result: PipelineResponse) -> bytes:
@@ -114,38 +114,61 @@ def pipeline_to_csv(result: PipelineResponse) -> bytes:
         raise ValueError("CSV export requires an OPTIMAL or FEASIBLE schedule")
     if not isinstance(result.schedule.assignments, list):
         raise ValueError("malformed schedule assignments")
-    if len(result.schedule.assignments) > MAX_EMPLOYEES * MAX_SHIFT_STARTS:
+    if len(result.schedule.assignments) > MAX_EMPLOYEES * MAX_SHIFT_CANDIDATES:
         raise ValueError("schedule assignments exceed solver v2 limits")
 
+    group_names = {group.id: group.name for group in result.groups}
     rows = []
     for assignment in result.schedule.assignments:
-        shift_start = _validate_assignment(assignment)
+        shift_start, shift_minutes = _validate_assignment(assignment)
+        break_text = ";".join(
+            f"{item.start}-{item.end}" for item in assignment.breaks
+        )
         for slot in assignment.groups_by_slot:
+            if slot.group_id not in group_names:
+                raise ValueError("schedule assignment references an unknown group")
             slot_start = _minutes(slot.start)
             rows.append(
                 (
                     assignment.date.isoformat(),
                     slot_start,
                     assignment.employee_id,
-                    shift_start,
+                    group_names[slot.group_id],
                     slot.group_id,
+                    shift_start,
+                    assignment.end,
+                    break_text,
+                    shift_minutes,
                 )
             )
-    rows.sort(key=lambda row: (row[0], row[1], row[2], row[3], row[4]))
+    rows.sort(key=lambda row: (row[0], row[1], row[2], row[5], row[4]))
 
     output = io.StringIO(newline="")
     writer = csv.writer(output, lineterminator="\r\n")
     writer.writerow(HEADERS)
-    for day, slot_start, employee_id, shift_start, group_id in rows:
+    for (
+        day,
+        slot_start,
+        employee_id,
+        group_name,
+        group_id,
+        shift_start,
+        shift_end,
+        break_text,
+        shift_minutes,
+    ) in rows:
         writer.writerow(
             (
                 _excel_safe(employee_id),
                 day,
-                _time_text(shift_start),
-                _time_text(shift_start + 90),
                 _time_text(slot_start),
                 _time_text(slot_start + 30),
                 _excel_safe(group_id),
+                _excel_safe(group_name),
+                _time_text(shift_start),
+                shift_end,
+                break_text,
+                shift_minutes,
             )
         )
     return output.getvalue().encode("utf-8-sig")

@@ -10,10 +10,10 @@ from openpyxl import Workbook
 
 from backend.app import import_calls
 from backend.app.import_calls import CallImportError, parse_calls_import
-from backend.app.pipeline import PipelineHistoryObservation, PipelinePlannedCalls
+from backend.app.models import CallIntervalObservation, PlannedCallInterval
 
 
-HEADER = ("date", "hour", "group_id", "calls")
+HEADER = ("date", "start", "group_id", "calls")
 
 
 def csv_bytes(rows, *, header=HEADER, bom=False):
@@ -23,6 +23,23 @@ def csv_bytes(rows, *, header=HEADER, bom=False):
     writer.writerows(rows)
     text = stream.getvalue()
     return (("\ufeff" if bom else "") + text).encode("utf-8")
+
+
+def planned_import_rows(count):
+    rows = []
+    for index in range(count):
+        day_offset, cell = divmod(index, 48 * 10)
+        slot, group = divmod(cell, 10)
+        start = f"{slot // 2:02d}:{(slot % 2) * 30:02d}"
+        rows.append(
+            (
+                (date(2026, 11, 2) + timedelta(days=day_offset)).isoformat(),
+                start,
+                f"group-{group}",
+                0,
+            )
+        )
+    return rows
 
 
 def xlsx_bytes(rows, *, sheet_names=("calls",), formula=None):
@@ -173,8 +190,8 @@ def assert_xlsx_rejected_before_iterparse(data, monkeypatch, message):
 def test_csv_history_returns_existing_models_and_preserves_zero_and_unicode(bom):
     data = csv_bytes(
         [
-            ("2026-10-05", "8", "販売", "0"),
-            ("2026-10-12", "8", "販売", "12"),
+            ("2026-10-05", "08:00", "販売", "0"),
+            ("2026-10-12", "08:00", "販売", "12"),
         ],
         bom=bom,
     )
@@ -183,10 +200,10 @@ def test_csv_history_returns_existing_models_and_preserves_zero_and_unicode(bom)
         data, file_format="csv", mode="history", group_ids=["販売"]
     )
 
-    assert all(isinstance(record, PipelineHistoryObservation) for record in records)
-    assert [(item.date, item.hour, item.group_id, item.calls) for item in records] == [
-        (date(2026, 10, 5), 8, "販売", 0),
-        (date(2026, 10, 12), 8, "販売", 12),
+    assert all(isinstance(record, CallIntervalObservation) for record in records)
+    assert [(item.date, item.start, item.group_id, item.calls) for item in records] == [
+        (date(2026, 10, 5), "08:00", "販売", 0),
+        (date(2026, 10, 12), "08:00", "販売", 12),
     ]
 
 
@@ -194,8 +211,8 @@ def test_csv_planned_calls_maps_calls_to_pipeline_field_and_keeps_fraction():
     records = parse_calls_import(
         csv_bytes(
             [
-                ("2026-11-02", "8", "sales", "2.5"),
-                ("2026-11-02", "9", "sales", "0"),
+                ("2026-11-02", "08:00", "sales", "2.5"),
+                ("2026-11-02", "09:00", "sales", "0"),
             ]
         ),
         file_format="csv",
@@ -203,8 +220,34 @@ def test_csv_planned_calls_maps_calls_to_pipeline_field_and_keeps_fraction():
         group_ids=["sales"],
     )
 
-    assert all(isinstance(record, PipelinePlannedCalls) for record in records)
-    assert [item.calls_per_hour for item in records] == [2.5, 0.0]
+    assert all(isinstance(record, PlannedCallInterval) for record in records)
+    assert [item.calls for item in records] == [2.5, 0.0]
+
+
+@pytest.mark.parametrize("file_format", ["csv", "xlsx"])
+def test_planned_import_accepts_3360_rows_and_rejects_3361(file_format):
+    group_ids = [f"group-{index}" for index in range(10)]
+
+    def import_data(rows):
+        data = (
+            csv_bytes(rows)
+            if file_format == "csv"
+            else xlsx_bytes([HEADER, *rows])
+        )
+        return parse_calls_import(
+            data,
+            file_format=file_format,
+            mode="planned_calls",
+            group_ids=group_ids,
+        )
+
+    accepted = import_data(planned_import_rows(3_360))
+    assert len(accepted) == 3_360
+
+    with pytest.raises(
+        CallImportError, match="maximum of 3360 data rows exceeded"
+    ):
+        import_data(planned_import_rows(3_361))
 
 
 @pytest.mark.parametrize(
@@ -213,15 +256,15 @@ def test_csv_planned_calls_maps_calls_to_pipeline_field_and_keeps_fraction():
         (
             "history",
             [
-                [datetime(2026, 10, 5), 8, "sales", 0],
-                [date(2026, 10, 12), 8, "sales", 2],
+                [datetime(2026, 10, 5), "08:00", "sales", 0],
+                [date(2026, 10, 12), "08:00", "sales", 2],
             ],
-            PipelineHistoryObservation,
+            CallIntervalObservation,
         ),
         (
             "planned_calls",
-            [[date(2026, 11, 2), 8, "sales", 2.5]],
-            PipelinePlannedCalls,
+            [[date(2026, 11, 2), "08:00", "sales", 2.5]],
+            PlannedCallInterval,
         ),
     ],
 )
@@ -238,7 +281,7 @@ def test_xlsx_parses_date_cells_and_returns_pipeline_models(mode, rows, model_ty
 
 def test_csv_group_is_trimmed_but_must_be_selected():
     records = parse_calls_import(
-        csv_bytes([("2026-10-05", "8", " sales ", "1")]),
+        csv_bytes([("2026-10-05", "08:00", " sales ", "1")]),
         file_format="csv",
         mode="history",
         group_ids=["sales"],
@@ -250,10 +293,10 @@ def test_csv_group_is_trimmed_but_must_be_selected():
 @pytest.mark.parametrize(
     "header",
     [
-        ("date", "hour", "group_id"),
-        ("date", "hour", "group_id", "calls", "extra"),
-        ("Date", "hour", "group_id", "calls"),
-        ("hour", "date", "group_id", "calls"),
+        ("date", "start", "group_id"),
+        ("date", "start", "group_id", "calls", "extra"),
+        ("Date", "start", "group_id", "calls"),
+        ("start", "date", "group_id", "calls"),
     ],
 )
 def test_csv_rejects_missing_unknown_or_misordered_headers(header):
@@ -269,17 +312,17 @@ def test_csv_rejects_missing_unknown_or_misordered_headers(header):
 @pytest.mark.parametrize(
     ("mode", "row", "sensitive_value"),
     [
-        ("history", ("2026-11-02", "23", "sales", "1"), "23"),
+        ("history", ("2026-11-02", "08:15", "sales", "1"), "08:15"),
         (
             "history",
-            ("2026-11-02", "8", "private_group_value", "1"),
+            ("2026-11-02", "08:00", "private_group_value", "1"),
             "private_group_value",
         ),
-        ("history", ("2026-11-02", "8", "sales", "-1"), "-1"),
-        ("history", ("private_date_value", "8", "sales", "1"), "private_date_value"),
-        ("history", ("2026-11-02", "8", "sales", ""), None),
-        ("planned_calls", ("2026-11-02", "8", "sales", "-1.5"), "-1.5"),
-        ("planned_calls", ("2026-11-02", "8", "sales", "inf"), "inf"),
+        ("history", ("2026-11-02", "08:00", "sales", "-1"), "-1"),
+        ("history", ("private_date_value", "08:00", "sales", "1"), "private_date_value"),
+        ("history", ("2026-11-02", "08:00", "sales", ""), None),
+        ("planned_calls", ("2026-11-02", "08:00", "sales", "-1.5"), "-1.5"),
+        ("planned_calls", ("2026-11-02", "08:00", "sales", "inf"), "inf"),
     ],
 )
 def test_csv_rejects_invalid_rows_with_safe_row_number(mode, row, sensitive_value):
@@ -299,8 +342,8 @@ def test_csv_rejects_invalid_rows_with_safe_row_number(mode, row, sensitive_valu
 def test_csv_rejects_duplicates_after_group_normalization():
     data = csv_bytes(
         [
-            ("2026-10-05", "8", "sales", "1"),
-            ("2026-10-05", "8", " sales ", "2"),
+            ("2026-10-05", "08:00", "sales", "1"),
+            ("2026-10-05", "08:00", " sales ", "2"),
         ]
     )
 
@@ -313,12 +356,12 @@ def test_csv_rejects_duplicates_after_group_normalization():
 @pytest.mark.parametrize(
     "row",
     [
-        b"2026-10-05,8,sales\n",
-        b"2026-10-05,8,sales,1,extra\n",
+        b"2026-10-05,08:00,sales\n",
+        b"2026-10-05,08:00,sales,1,extra\n",
     ],
 )
 def test_csv_rejects_rows_with_missing_or_extra_values(row):
-    data = b"date,hour,group_id,calls\n" + row
+    data = b"date,start,group_id,calls\n" + row
 
     with pytest.raises(CallImportError, match="four values"):
         parse_calls_import(
@@ -334,7 +377,7 @@ def test_csv_rejects_empty_input_rows_and_malformed_quotes():
 
     with pytest.raises(CallImportError, match="row"):
         parse_calls_import(
-            b'date,hour,group_id,calls\n"2026-10-05,8,sales,1\n',
+            b'date,start,group_id,calls\n"2026-10-05,08:00,sales,1\n',
             file_format="csv",
             mode="history",
             group_ids=["sales"],
@@ -344,7 +387,7 @@ def test_csv_rejects_empty_input_rows_and_malformed_quotes():
 def test_csv_does_not_evaluate_formula_like_group_values():
     formula = "=1+1"
     records = parse_calls_import(
-        csv_bytes([("2026-10-05", "8", formula, "1")]),
+        csv_bytes([("2026-10-05", "08:00", formula, "1")]),
         file_format="csv",
         mode="history",
         group_ids=[formula],
@@ -358,7 +401,7 @@ def test_xlsx_rejects_formula_cells_without_echoing_formula():
     with pytest.raises(CallImportError) as error:
         parse_calls_import(
             xlsx_bytes(
-                [HEADER, ["2026-11-02", 8, "sales", 1]],
+                [HEADER, ["2026-11-02", "08:00", "sales", 1]],
                 formula=("D2", formula),
             ),
             file_format="xlsx",
@@ -374,7 +417,7 @@ def test_xlsx_rejects_formula_in_header():
     with pytest.raises(CallImportError, match="formula"):
         parse_calls_import(
             xlsx_bytes(
-                [HEADER, ["2026-11-02", 8, "sales", 1]],
+                [HEADER, ["2026-11-02", "08:00", "sales", 1]],
                 formula=("A1", '="date"'),
             ),
             file_format="xlsx",
@@ -384,9 +427,9 @@ def test_xlsx_rejects_formula_in_header():
 
 
 def test_xlsx_rejects_formula_in_relationship_target_worksheet():
-    base = xlsx_bytes([HEADER, ["2026-11-02", 8, "sales", 1]])
+    base = xlsx_bytes([HEADER, ["2026-11-02", "08:00", "sales", 1]])
     formula_workbook = xlsx_bytes(
-        [HEADER, ["2026-11-02", 8, "sales", 1]],
+        [HEADER, ["2026-11-02", "08:00", "sales", 1]],
         formula=("E2", "=1+1"),
     )
     with zipfile.ZipFile(io.BytesIO(formula_workbook)) as archive:
@@ -406,7 +449,7 @@ def test_xlsx_rejects_formula_in_relationship_target_worksheet():
 
 def test_xlsx_accepts_a_benign_renamed_worksheet():
     data = rename_worksheet_xlsx(
-        xlsx_bytes([HEADER, ["2026-11-02", 8, "sales", 1]]),
+        xlsx_bytes([HEADER, ["2026-11-02", "08:00", "sales", 1]]),
         "odd.xml",
         remove_original=True,
     )
@@ -423,8 +466,19 @@ def test_xlsx_accepts_a_benign_renamed_worksheet():
 
 
 def test_xlsx_enforces_row_limit_in_relationship_target_worksheet():
-    base = xlsx_bytes([HEADER, ["2026-11-02", 8, "sales", 1]])
-    rows = [HEADER, *([["2026-11-02", 8, "sales", 1]] * 1_611)]
+    base = xlsx_bytes([HEADER, ["2000-01-01", "08:00", "sales", 1]])
+    rows = [
+        HEADER,
+        *[
+            [
+                (date(2000, 1, 1) + timedelta(days=index)).isoformat(),
+                "08:00",
+                "sales",
+                1,
+            ]
+            for index in range(3_361)
+        ],
+    ]
     long_workbook = xlsx_bytes(rows)
     with zipfile.ZipFile(io.BytesIO(long_workbook)) as archive:
         long_worksheet = archive.read("xl/worksheets/sheet1.xml")
@@ -444,7 +498,7 @@ def test_xlsx_enforces_row_limit_in_relationship_target_worksheet():
 def test_xlsx_rejects_shared_strings_over_count_limit_before_loading(monkeypatch):
     strings = ["date", *(f"{index:05x}" for index in range(40_004))]
     data = add_shared_strings_xlsx(
-        xlsx_bytes([HEADER, ["2026-11-02", 8, "sales", 1]]),
+        xlsx_bytes([HEADER, ["2026-11-02", "08:00", "sales", 1]]),
         strings,
     )
 
@@ -455,7 +509,7 @@ def test_xlsx_rejects_shared_strings_over_character_limit_before_loading(
     monkeypatch,
 ):
     data = add_shared_strings_xlsx(
-        xlsx_bytes([HEADER, ["2026-11-02", 8, "sales", 1]]),
+        xlsx_bytes([HEADER, ["2026-11-02", "08:00", "sales", 1]]),
         ["date", "x" * 200_001],
         compression=zipfile.ZIP_STORED,
     )
@@ -472,7 +526,7 @@ def test_xlsx_rejects_shared_string_rich_runs_before_openpyxl(monkeypatch):
         + b"</si></sst>"
     )
     data = add_shared_strings_xlsx(
-        xlsx_bytes([HEADER, ["2026-11-02", 8, "sales", 1]]),
+        xlsx_bytes([HEADER, ["2026-11-02", "08:00", "sales", 1]]),
         [],
         shared_strings_xml=shared_strings,
         compression=zipfile.ZIP_STORED,
@@ -484,7 +538,7 @@ def test_xlsx_rejects_shared_string_rich_runs_before_openpyxl(monkeypatch):
 
 def test_xlsx_rejects_shared_strings_manifest_path_mismatch(monkeypatch):
     base = add_shared_strings_xlsx(
-        xlsx_bytes([HEADER, ["2026-11-02", 8, "sales", 1]]),
+        xlsx_bytes([HEADER, ["2026-11-02", "08:00", "sales", 1]]),
         ["date"],
     )
     with zipfile.ZipFile(io.BytesIO(base)) as archive:
@@ -508,7 +562,7 @@ def test_xlsx_rejects_shared_strings_manifest_path_mismatch(monkeypatch):
 
 
 def test_xlsx_rejects_duplicate_workbook_manifest_parts(monkeypatch):
-    base = xlsx_bytes([HEADER, ["2026-11-02", 8, "sales", 1]])
+    base = xlsx_bytes([HEADER, ["2026-11-02", "08:00", "sales", 1]])
     with zipfile.ZipFile(io.BytesIO(base)) as archive:
         content_types = archive.read("[Content_Types].xml")
     duplicate_workbook = (
@@ -530,7 +584,7 @@ def test_xlsx_rejects_duplicate_workbook_manifest_parts(monkeypatch):
 
 
 def test_xlsx_rejects_oversized_styles_xml_before_openpyxl(monkeypatch):
-    base = xlsx_bytes([HEADER, ["2026-11-02", 8, "sales", 1]])
+    base = xlsx_bytes([HEADER, ["2026-11-02", "08:00", "sales", 1]])
     with zipfile.ZipFile(io.BytesIO(base)) as archive:
         styles = archive.read("xl/styles.xml")
     style_records = b"".join(
@@ -555,7 +609,7 @@ def test_xlsx_rejects_oversized_styles_xml_before_openpyxl(monkeypatch):
 
 
 def test_xlsx_rejects_styles_with_too_many_elements_before_openpyxl(monkeypatch):
-    base = xlsx_bytes([HEADER, ["2026-11-02", 8, "sales", 1]])
+    base = xlsx_bytes([HEADER, ["2026-11-02", "08:00", "sales", 1]])
     with zipfile.ZipFile(io.BytesIO(base)) as archive:
         styles = archive.read("xl/styles.xml")
     styles = styles.replace(
@@ -576,7 +630,7 @@ def test_xlsx_rejects_styles_with_too_many_elements_before_openpyxl(monkeypatch)
 def test_xlsx_rejects_xml_element_with_too_many_attributes_before_openpyxl(
     monkeypatch,
 ):
-    base = xlsx_bytes([HEADER, ["2026-11-02", 8, "sales", 1]])
+    base = xlsx_bytes([HEADER, ["2026-11-02", "08:00", "sales", 1]])
     with zipfile.ZipFile(io.BytesIO(base)) as archive:
         styles = archive.read("xl/styles.xml")
     attributes = b" ".join(
@@ -595,7 +649,7 @@ def test_xlsx_rejects_xml_element_with_too_many_attributes_before_openpyxl(
 
 
 def test_xlsx_rejects_excessive_namespace_declarations_before_openpyxl(monkeypatch):
-    base = xlsx_bytes([HEADER, ["2026-11-02", 8, "sales", 1]])
+    base = xlsx_bytes([HEADER, ["2026-11-02", "08:00", "sales", 1]])
     declarations = b" ".join(
         f'xmlns:p{index}="urn:test:{index}"'.encode() for index in range(65)
     )
@@ -606,7 +660,7 @@ def test_xlsx_rejects_excessive_namespace_declarations_before_openpyxl(monkeypat
 
 
 def test_xlsx_rejects_100001_namespace_markers_before_iterparse(monkeypatch):
-    base = xlsx_bytes([HEADER, ["2026-11-02", 8, "sales", 1]])
+    base = xlsx_bytes([HEADER, ["2026-11-02", "08:00", "sales", 1]])
     declarations = b" ".join(
         f'xmlns:p{index}="u"'.encode() for index in range(100_001)
     )
@@ -618,7 +672,7 @@ def test_xlsx_rejects_100001_namespace_markers_before_iterparse(monkeypatch):
 
 
 def test_xlsx_rejects_ordinary_attribute_bomb_before_iterparse(monkeypatch):
-    base = xlsx_bytes([HEADER, ["2026-11-02", 8, "sales", 1]])
+    base = xlsx_bytes([HEADER, ["2026-11-02", "08:00", "sales", 1]])
     attributes = b" ".join(
         f'a{index}="x"'.encode() for index in range(100_001)
     )
@@ -630,7 +684,7 @@ def test_xlsx_rejects_ordinary_attribute_bomb_before_iterparse(monkeypatch):
 
 
 def test_xlsx_rejects_distributed_namespace_markers_per_xml_part(monkeypatch):
-    base = xlsx_bytes([HEADER, ["2026-11-02", 8, "sales", 1]])
+    base = xlsx_bytes([HEADER, ["2026-11-02", "08:00", "sales", 1]])
     children = b"".join(
         f'<e xmlns:p{index}="u"/>'.encode() for index in range(257)
     )
@@ -643,7 +697,7 @@ def test_xlsx_rejects_distributed_namespace_markers_per_xml_part(monkeypatch):
 
 
 def test_xlsx_accepts_256_namespace_markers_per_xml_part():
-    base = xlsx_bytes([HEADER, ["2026-11-02", 8, "sales", 1]])
+    base = xlsx_bytes([HEADER, ["2026-11-02", "08:00", "sales", 1]])
     children = b"".join(
         f'<e xmlns:p{index}="u"/>'.encode() for index in range(256)
     )
@@ -665,7 +719,7 @@ def test_xlsx_accepts_256_namespace_markers_per_xml_part():
 def test_xlsx_rejects_oversized_quote_aware_markup_token_before_iterparse(
     monkeypatch,
 ):
-    base = xlsx_bytes([HEADER, ["2026-11-02", 8, "sales", 1]])
+    base = xlsx_bytes([HEADER, ["2026-11-02", "08:00", "sales", 1]])
     value = b"".join(f"{index:04x}".encode() for index in range(2_048))
     value = value[:4_096] + b">" + value[4_097:]
     xml_part = b'<root value="' + value + b'"/>'
@@ -688,7 +742,7 @@ def test_xlsx_rejects_oversized_quote_aware_markup_token_before_iterparse(
     ],
 )
 def test_xlsx_rejects_non_utf8_xml_before_iterparse(monkeypatch, xml_part):
-    base = xlsx_bytes([HEADER, ["2026-11-02", 8, "sales", 1]])
+    base = xlsx_bytes([HEADER, ["2026-11-02", "08:00", "sales", 1]])
     data = rewrite_xlsx(base, additions=[("docProps/extra.xml", xml_part)])
 
     assert_xlsx_rejected_before_iterparse(data, monkeypatch, "UTF-8|NUL")
@@ -697,7 +751,7 @@ def test_xlsx_rejects_non_utf8_xml_before_iterparse(monkeypatch, xml_part):
 def test_xlsx_rejects_literal_namespace_marker_false_positive_in_comment(
     monkeypatch,
 ):
-    base = xlsx_bytes([HEADER, ["2026-11-02", 8, "sales", 1]])
+    base = xlsx_bytes([HEADER, ["2026-11-02", "08:00", "sales", 1]])
     comment = b"<!--" + b"xmlns " * 257 + b"-->"
     data = rewrite_xlsx(
         base,
@@ -708,7 +762,7 @@ def test_xlsx_rejects_literal_namespace_marker_false_positive_in_comment(
 
 
 def test_xlsx_accepts_utf8_bom_escaped_text_and_standard_xml_declaration():
-    base = xlsx_bytes([HEADER, ["2026-11-02", 8, "R&D", 1]])
+    base = xlsx_bytes([HEADER, ["2026-11-02", "08:00", "R&D", 1]])
     with zipfile.ZipFile(io.BytesIO(base)) as archive:
         worksheet = archive.read("xl/worksheets/sheet1.xml")
     assert b"R&amp;D" in worksheet
@@ -728,7 +782,7 @@ def test_xlsx_accepts_utf8_bom_escaped_text_and_standard_xml_declaration():
 
 
 def test_xlsx_markup_scan_distinguishes_comment_cdata_and_processing_instruction():
-    base = xlsx_bytes([HEADER, ["2026-11-02", 8, "sales", 1]])
+    base = xlsx_bytes([HEADER, ["2026-11-02", "08:00", "sales", 1]])
     xml_part = (
         b'<?xml version="1.0" encoding="UTF-8"?>'
         b"<root><!-- > < -->"
@@ -747,7 +801,7 @@ def test_xlsx_markup_scan_distinguishes_comment_cdata_and_processing_instruction
 
 
 def test_xlsx_rejects_less_than_inside_quoted_attribute_via_xml_parser(monkeypatch):
-    base = xlsx_bytes([HEADER, ["2026-11-02", 8, "sales", 1]])
+    base = xlsx_bytes([HEADER, ["2026-11-02", "08:00", "sales", 1]])
     data = rewrite_xlsx(
         base,
         additions=[("docProps/extra.xml", b'<root value="left < right"/>')],
@@ -757,7 +811,7 @@ def test_xlsx_rejects_less_than_inside_quoted_attribute_via_xml_parser(monkeypat
 
 
 def test_xlsx_continues_rejecting_dtd_and_entity_declarations(monkeypatch):
-    base = xlsx_bytes([HEADER, ["2026-11-02", 8, "sales", 1]])
+    base = xlsx_bytes([HEADER, ["2026-11-02", "08:00", "sales", 1]])
     xml_part = b'<!DOCTYPE root [<!ENTITY item "value">]><root>&item;</root>'
     data = rewrite_xlsx(base, additions=[("docProps/extra.xml", xml_part)])
 
@@ -765,7 +819,7 @@ def test_xlsx_continues_rejecting_dtd_and_entity_declarations(monkeypatch):
 
 
 def test_xlsx_enforces_global_xml_element_limit_before_openpyxl(monkeypatch):
-    base = xlsx_bytes([HEADER, ["2026-11-02", 8, "sales", 1]])
+    base = xlsx_bytes([HEADER, ["2026-11-02", "08:00", "sales", 1]])
     xml_part = b"<root>" + b"<e/>" * 4_000 + b"</root>"
     data = rewrite_xlsx(
         base,
@@ -785,7 +839,7 @@ def test_xlsx_enforces_global_xml_element_limit_before_openpyxl(monkeypatch):
 
 
 def test_xlsx_enforces_global_xml_attribute_limit_before_openpyxl(monkeypatch):
-    base = xlsx_bytes([HEADER, ["2026-11-02", 8, "sales", 1]])
+    base = xlsx_bytes([HEADER, ["2026-11-02", "08:00", "sales", 1]])
     with zipfile.ZipFile(io.BytesIO(base)) as archive:
         theme = archive.read("xl/theme/theme1.xml")
     attributes = b" ".join(
@@ -808,7 +862,7 @@ def test_xlsx_enforces_global_xml_attribute_limit_before_openpyxl(monkeypatch):
 
 
 def test_xlsx_rejects_excessive_xml_depth_before_openpyxl(monkeypatch):
-    base = xlsx_bytes([HEADER, ["2026-11-02", 8, "sales", 1]])
+    base = xlsx_bytes([HEADER, ["2026-11-02", "08:00", "sales", 1]])
     with zipfile.ZipFile(io.BytesIO(base)) as archive:
         theme = archive.read("xl/theme/theme1.xml")
     nested = b"<a:n>" * 65 + b"</a:n>" * 65
@@ -828,7 +882,7 @@ def test_xlsx_rejects_excessive_xml_depth_before_openpyxl(monkeypatch):
 def test_xlsx_rejects_malformed_eager_xml_with_sanitized_error(monkeypatch):
     secret = b"SENSITIVE_MALFORMED_THEME"
     data = rewrite_xlsx(
-        xlsx_bytes([HEADER, ["2026-11-02", 8, "sales", 1]]),
+        xlsx_bytes([HEADER, ["2026-11-02", "08:00", "sales", 1]]),
         updates={"xl/theme/theme1.xml": b"<a:theme>" + secret},
     )
 
@@ -836,7 +890,7 @@ def test_xlsx_rejects_malformed_eager_xml_with_sanitized_error(monkeypatch):
 
 
 def test_xlsx_rejects_calls_outside_finite_float_range_safely():
-    base = xlsx_bytes([HEADER, ["2026-11-02", 8, "sales", 1]])
+    base = xlsx_bytes([HEADER, ["2026-11-02", "08:00", "sales", 1]])
     with zipfile.ZipFile(io.BytesIO(base)) as archive:
         worksheet = archive.read("xl/worksheets/sheet1.xml")
     huge_number = "9" * 400
@@ -861,7 +915,7 @@ def test_xlsx_rejects_calls_outside_finite_float_range_safely():
 
 
 def test_xlsx_rejects_macro_content_and_external_link_parts():
-    base = xlsx_bytes([HEADER, ["2026-11-02", 8, "sales", 1]])
+    base = xlsx_bytes([HEADER, ["2026-11-02", "08:00", "sales", 1]])
     with zipfile.ZipFile(io.BytesIO(base)) as archive:
         content_types = archive.read("[Content_Types].xml")
     macro_content_types = content_types.replace(
@@ -887,7 +941,7 @@ def test_xlsx_rejects_macro_content_and_external_link_parts():
 
 
 def test_xlsx_rejects_external_relationships_and_unsafe_zip_paths():
-    base = xlsx_bytes([HEADER, ["2026-11-02", 8, "sales", 1]])
+    base = xlsx_bytes([HEADER, ["2026-11-02", "08:00", "sales", 1]])
     rels = (
         b'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
         b'<Relationship Target="https://example.invalid/book.xlsx" '
@@ -928,7 +982,7 @@ def test_xlsx_rejects_an_extra_sheet():
     with pytest.raises(CallImportError, match="sheet"):
         parse_calls_import(
             xlsx_bytes(
-                [HEADER, ["2026-11-02", 8, "sales", 1]],
+                [HEADER, ["2026-11-02", "08:00", "sales", 1]],
                 sheet_names=("calls", "extra"),
             ),
             file_format="xlsx",
@@ -943,7 +997,7 @@ def test_xlsx_rejects_an_extra_sheet():
 )
 def test_xlsx_rejects_an_unreferenced_worksheet_part(part_name):
     data = rewrite_xlsx(
-        xlsx_bytes([HEADER, ["2026-11-02", 8, "sales", 1]]),
+        xlsx_bytes([HEADER, ["2026-11-02", "08:00", "sales", 1]]),
         additions=[(part_name, b"<worksheet/>")],
     )
 
@@ -957,7 +1011,7 @@ def test_xlsx_rejects_an_unreferenced_worksheet_part(part_name):
 
 
 def test_xlsx_enforces_workbook_metadata_size_limit():
-    base = xlsx_bytes([HEADER, ["2026-11-02", 8, "sales", 1]])
+    base = xlsx_bytes([HEADER, ["2026-11-02", "08:00", "sales", 1]])
     with zipfile.ZipFile(io.BytesIO(base)) as archive:
         workbook_xml = archive.read("xl/workbook.xml")
     workbook_xml = workbook_xml.replace(
@@ -980,7 +1034,7 @@ def test_xlsx_enforces_workbook_metadata_size_limit():
 
 
 def test_xlsx_rejects_zip_bombs_and_too_many_entries():
-    base = xlsx_bytes([HEADER, ["2026-11-02", 8, "sales", 1]])
+    base = xlsx_bytes([HEADER, ["2026-11-02", "08:00", "sales", 1]])
     bomb = rewrite_xlsx(
         base,
         additions=[("large.txt", b"x" * 200_000)],
@@ -1002,7 +1056,18 @@ def test_xlsx_rejects_zip_bombs_and_too_many_entries():
 
 
 def test_xlsx_enforces_pipeline_row_limits():
-    rows = [HEADER, *([["2026-11-02", 8, "sales", 1]] * 1_611)]
+    rows = [
+        HEADER,
+        *[
+            [
+                (date(2000, 1, 1) + timedelta(days=index)).isoformat(),
+                "08:00",
+                "sales",
+                1,
+            ]
+            for index in range(import_calls.MAX_INTERVAL_ROWS + 1)
+        ],
+    ]
 
     with pytest.raises(CallImportError, match="maximum"):
         parse_calls_import(
@@ -1029,12 +1094,12 @@ def test_import_rejects_oversized_files_and_path_inputs_without_reading_them(tmp
 
 @pytest.mark.parametrize(
     ("mode", "limit"),
-    [("history", 10_000), ("planned_calls", 1_610)],
+    [("history", 10_000), ("planned_calls", import_calls.MAX_INTERVAL_ROWS)],
 )
 def test_csv_enforces_pipeline_row_limits(mode, limit):
     day = date(2000, 1, 1)
     rows = [
-        ((day + timedelta(days=index)).isoformat(), "8", "sales", "1")
+        ((day + timedelta(days=index)).isoformat(), "08:00", "sales", "1")
         for index in range(limit + 1)
     ]
 
@@ -1062,7 +1127,7 @@ def test_xlsx_error_is_sanitized_for_invalid_bytes():
 
 
 def test_parser_rejects_invalid_mode_format_and_group_list():
-    data = csv_bytes([("2026-10-05", "8", "sales", "1")])
+    data = csv_bytes([("2026-10-05", "08:00", "sales", "1")])
     for arguments in (
         {"mode": "other", "file_format": "csv", "group_ids": ["sales"]},
         {"mode": "history", "file_format": "xls", "group_ids": ["sales"]},

@@ -7,7 +7,7 @@ import threading
 from fastapi.testclient import TestClient
 import pytest
 
-from backend.app import import_calls, main
+from backend.app import main
 from backend.app.export import HEADERS, pipeline_to_csv
 from backend.app.main import app
 from backend.app.pipeline import PipelineResponse
@@ -52,7 +52,7 @@ def test_export_api_renders_the_supplied_sample_without_rerunning_pipeline(
     assert rows[0] == list(HEADERS)
     assert rows[1][0] == "e01"
     assert rows[1][1] == "2026-11-02"
-    assert rows[1][6] == "sales"
+    assert rows[1][4] == "sales"
 
 
 def test_export_api_accepts_a_feasible_empty_schedule():
@@ -105,7 +105,7 @@ def test_export_api_sanitizes_malformed_schedule_time():
 
     assert response.status_code == 422
     assert marker not in response.text
-    assert response.json() == {"detail": "malformed schedule time"}
+    assert response.json() == {"detail": "Invalid pipeline response."}
 
 
 def test_export_api_rejects_invalid_json_without_echoing_body():
@@ -150,7 +150,7 @@ def test_export_api_counts_actual_body_bytes_even_with_small_content_length(
 
     monkeypatch.setattr(main, "run_pipeline", unexpected_pipeline_call)
     response = post_export(
-        b"x" * (import_calls.MAX_FILE_BYTES + 1),
+        b"x" * (main.MAX_EXPORT_BODY_BYTES + 1),
         headers={
             "Content-Type": "application/json",
             "Content-Length": "1",
@@ -165,7 +165,7 @@ def test_export_api_rejects_declared_oversized_body_early():
         b"{}",
         headers={
             "Content-Type": "application/json",
-            "Content-Length": str(import_calls.MAX_FILE_BYTES + 1),
+            "Content-Length": str(main.MAX_EXPORT_BODY_BYTES + 1),
         },
     )
 

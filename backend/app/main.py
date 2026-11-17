@@ -1,4 +1,5 @@
 import threading
+from datetime import date
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.exception_handlers import request_validation_exception_handler
@@ -8,22 +9,29 @@ from pydantic import ValidationError
 from starlette.concurrency import run_in_threadpool
 
 from .export import pipeline_to_csv
+from .database_sample import (
+    DatabaseSampleImportError,
+    DatabaseSampleImportResponse,
+    parse_database_sample_bundle,
+)
 from .import_calls import (
-    MAX_FILE_BYTES,
     CallImportError,
     CallImportFormat,
     CallImportMode,
     CallImportRecord,
     parse_calls_import,
 )
-from .models import ScheduleRequest, SolveResponse
+from .limits import (
+    MAX_EXPORT_BODY_BYTES,
+    MAX_SCHEDULE_BODY_BYTES,
+    MAX_UPLOAD_BYTES,
+)
 from .pipeline import (
     PipelineDomainError,
     PipelineRequest,
     PipelineResponse,
     run_pipeline,
 )
-from .solver import solve_schedule
 from .solver_v2 import MAX_GROUPS
 
 
@@ -31,8 +39,8 @@ app = FastAPI(
     title="MVP Xếp lịch nhân sự",
     version="0.1.0",
     description=(
-        "API local prototype. /api/solver-preview giữ solver v1; "
-        "/api/schedule-v2 là endpoint thử nghiệm pipeline, chưa phải contract "
+        "API local prototype. /api/schedule-v2 là endpoint thử nghiệm pipeline, "
+        "chưa phải contract "
         "sản phẩm đã chốt. /api/schedule-v2/export chỉ render CSV từ response "
         "caller gửi, không chạy pipeline/solver hay xác minh lịch. "
         "/api/calls/import chỉ parse rows CSV/XLSX, không chạy pipeline hoặc lưu file."
@@ -70,11 +78,37 @@ def _parse_calls_with_limit(
         _CALL_IMPORT_SEMAPHORE.release()
 
 
+def _parse_database_bundle_with_limit(
+    data: bytes,
+    *,
+    week_start: date,
+    history_start_date: date,
+    history_end_date: date,
+    group_ids: list[str] | None,
+) -> DatabaseSampleImportResponse:
+    if not _CALL_IMPORT_SEMAPHORE.acquire(blocking=False):
+        raise _CallImportBusy
+    try:
+        return parse_database_sample_bundle(
+            data,
+            week_start=week_start,
+            history_start_date=history_start_date,
+            history_end_date=history_end_date,
+            group_ids=group_ids,
+        )
+    finally:
+        _CALL_IMPORT_SEMAPHORE.release()
+
+
 def _validate_import_headers(request: Request, file_format: CallImportFormat) -> None:
     content_type = (
         request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
     )
-    expected_type = "text/csv" if file_format == "csv" else _XLSX_CONTENT_TYPE
+    expected_type = {
+        "csv": "text/csv",
+        "xlsx": _XLSX_CONTENT_TYPE,
+        "database_sample_bundle": "application/zip",
+    }[file_format]
     if content_type not in ("application/octet-stream", expected_type):
         raise HTTPException(status_code=415, detail="Unsupported import media type.")
 
@@ -86,25 +120,27 @@ def _validate_import_headers(request: Request, file_format: CallImportFormat) ->
         )
 
 
-async def _read_bounded_body(request: Request, *, body_name: str) -> bytes:
+async def _read_bounded_body(
+    request: Request, *, body_name: str, max_bytes: int
+) -> bytes:
     declared_length = request.headers.get("content-length")
     if declared_length is not None:
         try:
             declared_size = int(declared_length, 10)
         except ValueError:
             declared_size = -1
-        if declared_size > MAX_FILE_BYTES:
+        if declared_size > max_bytes:
             raise HTTPException(
                 status_code=413,
-                detail=f"{body_name} exceeds the 2 MiB size limit.",
+                detail=f"{body_name} exceeds the configured size limit.",
             )
 
     content = bytearray()
     async for chunk in request.stream():
-        if len(chunk) > MAX_FILE_BYTES - len(content):
+        if len(chunk) > max_bytes - len(content):
             raise HTTPException(
                 status_code=413,
-                detail=f"{body_name} exceeds the 2 MiB size limit.",
+                detail=f"{body_name} exceeds the configured size limit.",
             )
         content.extend(chunk)
     return bytes(content)
@@ -151,17 +187,40 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.post("/api/solver-preview", response_model=SolveResponse)
-def solver_preview(request: ScheduleRequest) -> SolveResponse:
-    """Run the week 1-2 solver through a small test/demo endpoint."""
-    return solve_schedule(request)
-
-
-@app.post("/api/schedule-v2", response_model=PipelineResponse)
-def schedule_v2(request: PipelineRequest) -> PipelineResponse:
+@app.post(
+    "/api/schedule-v2",
+    response_model=PipelineResponse,
+    openapi_extra={
+        "requestBody": {
+            "required": True,
+            "content": {
+                "application/json": {
+                    "schema": PipelineRequest.model_json_schema()
+                }
+            },
+        }
+    },
+)
+async def schedule_v2(request: Request) -> PipelineResponse:
     """Run the provisional weekly pipeline API with the existing request model."""
+    data = await _read_bounded_body(
+        request,
+        body_name="Schedule request",
+        max_bytes=MAX_SCHEDULE_BODY_BYTES,
+    )
     try:
-        return run_pipeline(request)
+        pipeline_request = PipelineRequest.model_validate_json(data)
+    except ValidationError as error:
+        raise RequestValidationError(
+            [
+                {**item, "loc": ("body", *item["loc"])}
+                for item in error.errors(
+                    include_input=False, include_context=False
+                )
+            ]
+        ) from None
+    try:
+        return run_pipeline(pipeline_request)
     except PipelineDomainError as error:
         raise HTTPException(status_code=422, detail=error.public_message) from None
 
@@ -170,9 +229,9 @@ def schedule_v2(request: PipelineRequest) -> PipelineResponse:
     "/api/calls/import",
     summary="Parse calls from a raw CSV or XLSX request body",
     description=(
-        "Local prototype endpoint. Send the file bytes directly, not multipart "
-        "form data. The selected file_format is explicit; no filename inference "
-        "or storage is performed."
+        "Local prototype endpoint. Send CSV/XLSX bytes or an exact pinned "
+        "Database Sample ZIP directly, not multipart form data. No filename "
+        "inference or storage is performed."
     ),
     openapi_extra={
         "requestBody": {
@@ -184,6 +243,7 @@ def schedule_v2(request: PipelineRequest) -> PipelineResponse:
                     "application/octet-stream",
                     "text/csv",
                     _XLSX_CONTENT_TYPE,
+                    "application/zip",
                 )
             },
         }
@@ -195,16 +255,62 @@ async def import_calls_route(
         ..., description="Explicit parser selection; no filename inference."
     ),
     mode: CallImportMode = Query(...),
-    group_id: list[str] = Query(
-        ...,
-        min_length=1,
+    group_id: list[str] | None = Query(
+        default=None,
         max_length=MAX_GROUPS,
-        description="Repeat once per selected group; IDs must be unique.",
+        description=(
+            "Repeat once per selected queue for a database_sample_bundle; "
+            "omit to select every source queue. Required for CSV/XLSX."
+        ),
+    ),
+    week_start: date | None = Query(
+        default=None, description="Required for database_sample_bundle."
+    ),
+    history_start_date: date | None = Query(
+        default=None, description="Inclusive source-history start date."
+    ),
+    history_end_date: date | None = Query(
+        default=None, description="Exclusive source-history end date."
     ),
 ) -> dict[str, object]:
-    """Parse bounded CSV/XLSX bytes into existing pipeline row models."""
+    """Parse generic interval rows or the exact pinned source bundle."""
     _validate_import_headers(request, file_format)
-    data = await _read_bounded_body(request, body_name="Import file")
+    data = await _read_bounded_body(
+        request, body_name="Import file", max_bytes=MAX_UPLOAD_BYTES
+    )
+    if file_format == "database_sample_bundle":
+        if mode != "history":
+            raise HTTPException(
+                status_code=422, detail="Database Sample bundle mode must be history."
+            )
+        if week_start is None or history_start_date is None or history_end_date is None:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "week_start, history_start_date and history_end_date are required."
+                ),
+            )
+        try:
+            result = await run_in_threadpool(
+                _parse_database_bundle_with_limit,
+                data,
+                week_start=week_start,
+                history_start_date=history_start_date,
+                history_end_date=history_end_date,
+                group_ids=group_id,
+            )
+        except _CallImportBusy:
+            raise HTTPException(
+                status_code=429,
+                detail="Another import is being parsed in this process.",
+                headers={"Retry-After": "1"},
+            ) from None
+        except DatabaseSampleImportError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from None
+        return result.model_dump(mode="json")
+
+    if group_id is None:
+        raise HTTPException(status_code=422, detail="group_id is required for CSV/XLSX.")
     try:
         records = await run_in_threadpool(
             _parse_calls_with_limit,
@@ -260,7 +366,9 @@ async def import_calls_route(
 async def export_schedule(request: Request) -> Response:
     """Render a bounded caller-provided pipeline response as a CSV attachment."""
     _validate_export_headers(request)
-    data = await _read_bounded_body(request, body_name="Export response")
+    data = await _read_bounded_body(
+        request, body_name="Export response", max_bytes=MAX_EXPORT_BODY_BYTES
+    )
     try:
         result = await run_in_threadpool(PipelineResponse.model_validate_json, data)
     except ValidationError:

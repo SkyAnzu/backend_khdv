@@ -1,45 +1,98 @@
 from copy import deepcopy
+from datetime import date, timedelta
 import math
 
 import pytest
 from pydantic import ValidationError
 
 from backend.app import pipeline
+from backend.app.models import ErlangCResponse
 from backend.app.pipeline import PipelineDomainError, PipelineRequest, run_pipeline
 from backend.app.solver_v2 import SolverV2Response
 
 
 WEEK = "2026-11-02"
+GROUPS = [{"id": "sales", "name": "Sales"}, {"id": "support", "name": "Support"}]
+SLOTS = ("08:00", "08:30")
 
 
-def operating_hours(hours=(8, 9), day=WEEK):
-    return [{"date": day, "hour": hour} for hour in hours]
+def operating_intervals():
+    return [{"date": WEEK, "start": "08:00", "end": "09:00"}]
 
 
-def employee(employee_id, skills=("sales",), hours=(8, 9)):
+def employee(employee_id="e1", skills=("sales", "support"), slots=SLOTS):
     return {
         "id": employee_id,
         "skills": list(skills),
-        "available_slots": [
-            {"date": WEEK, "start": start}
-            for hour in hours
-            for start in (f"{hour:02d}:00", f"{hour:02d}:30")
-        ],
+        "available_slots": [{"date": WEEK, "start": start} for start in slots],
         "unavailable_dates": [],
-        "max_work_minutes_per_week": 90,
+        "max_shift_minutes_per_week": 600,
     }
 
 
-def planned_calls(hours=(8, 9), groups=("sales",), volumes=None):
-    volumes = volumes or {8: 12, 9: 0}
+def planned_rows(calls=None, groups=None, slots=SLOTS):
+    calls = calls or {}
+    groups = groups or ["sales", "support"]
     return [
         {
             "date": WEEK,
-            "hour": hour,
+            "start": start,
             "group_id": group,
-            "calls_per_hour": volumes.get((hour, group), volumes.get(hour, 0)),
+            "calls": calls.get((start, group), 0.0),
         }
-        for hour in hours
+        for start in slots
+        for group in groups
+    ]
+
+
+def full_week_planned_payload():
+    group_ids = [f"group-{index}" for index in range(10)]
+    week_start = date.fromisoformat(WEEK)
+    operating = [
+        {
+            "date": (week_start + timedelta(days=day)).isoformat(),
+            "start": "00:00",
+            "end": "24:00",
+        }
+        for day in range(7)
+    ]
+    request = payload(
+        groups=[{"id": group, "name": group} for group in group_ids],
+        operating=operating,
+        targets=service_targets(group_ids),
+        aht=[],
+    )
+    request["employees"] = []
+    request["shifts"] = []
+    request["planned_calls"] = [
+        {
+            "date": interval["date"],
+            "start": f"{minute // 60:02d}:{minute % 60:02d}",
+            "group_id": group,
+            "calls": 0.0,
+        }
+        for interval in operating
+        for minute in range(0, 24 * 60, 30)
+        for group in group_ids
+    ]
+    return request
+
+
+def aht_rows(groups=("sales", "support"), cutoff=WEEK):
+    return [
+        {
+            "group_id": group,
+            "aht_seconds": 60.0,
+            "sample_count": 20,
+            "cutoff_before": cutoff,
+        }
+        for group in groups
+    ]
+
+
+def service_targets(groups=("sales", "support")):
+    return [
+        {"group_id": group, "target_sla": 0.8, "waiting_seconds": 20.0}
         for group in groups
     ]
 
@@ -47,264 +100,316 @@ def planned_calls(hours=(8, 9), groups=("sales",), volumes=None):
 def payload(
     *,
     mode="planned_calls",
-    hours=(8, 9),
-    groups=("sales",),
-    volumes=None,
+    groups=None,
+    operating=None,
+    calls=None,
     employees=None,
-    shift_starts=None,
-    allow_skill_fallback=False,
-    max_agents=10_000,
+    shifts=None,
+    targets=None,
+    aht=None,
 ):
-    return {
+    group_list = deepcopy(GROUPS if groups is None else groups)
+    group_ids = [item["id"] for item in group_list]
+    slots = SLOTS
+    request = {
         "mode": mode,
         "week_start": WEEK,
-        "groups": list(groups),
-        "operating_hours": operating_hours(hours),
-        "planned_calls": planned_calls(hours, groups, volumes),
+        "groups": group_list,
+        "operating_intervals": operating or operating_intervals(),
         "employees": employees
         if employees is not None
-        else [employee(f"e{index}") for index in range(1, 4)],
-        "shift_starts": shift_starts
-        if shift_starts is not None
-        else [{"date": WEEK, "start": "08:00"}],
-        "allow_skill_fallback": allow_skill_fallback,
+        else [employee(slots=slots)],
+        "shifts": shifts
+        if shifts is not None
+        else [{"date": WEEK, "start": "08:00", "end": "09:00", "breaks": []}],
+        "service_targets": targets
+        if targets is not None
+        else service_targets(group_ids),
+        "aht_by_group": aht if aht is not None else aht_rows(group_ids),
+        "allow_skill_fallback": False,
         "max_solve_seconds": 3,
-        "aht_seconds": 300,
-        "target_sla": 0.8,
-        "waiting_seconds": 20,
-        "max_agents": max_agents,
+        "max_agents": 10_000,
     }
+    if mode == "planned_calls":
+        request["planned_calls"] = planned_rows(calls, group_ids, slots)
+    else:
+        request["history_window"] = {
+            "start_date": "2026-10-01",
+            "end_date": WEEK,
+        }
+        request["history"] = [
+            {
+                "date": day,
+                "start": start,
+                "group_id": group,
+                "calls": values.get((start, group), 0),
+            }
+            for day, values in (
+                ("2026-10-19", {("08:00", "sales"): 2}),
+                ("2026-10-26", {("08:00", "sales"): 4}),
+            )
+            for start in slots
+            for group in group_ids
+        ]
+    return request
 
 
-def test_planned_calls_run_through_erlang_and_duplicate_hourly_need_to_two_slots():
-    request = PipelineRequest.model_validate(payload())
+def test_planned_calls_are_per_interval_and_erlang_rate_is_doubled(monkeypatch):
+    captured = []
+
+    def erlang(request):
+        captured.append(request)
+        return ErlangCResponse(required_staff=1, service_level=0.8)
+
+    monkeypatch.setattr(pipeline, "calculate_required_staff", erlang)
+    request = PipelineRequest.model_validate(
+        payload(calls={("08:00", "sales"): 1.5})
+    )
 
     result = run_pipeline(request)
 
     assert result.mode == "planned_calls"
     assert result.forecast is None
-    assert [
-        (item.hour, item.erlang.required_staff) for item in result.hourly_results
-    ] == [
-        (8, 3),
-        (9, 0),
-    ]
-    assert result.hourly_results[0].erlang.service_level == pytest.approx(0.9204, abs=1e-4)
-    assert [
-        (item.start, item.required_staff) for item in result.requirements
-    ] == [
-        ("08:00", 3),
-        ("08:30", 3),
-        ("09:00", 0),
-        ("09:30", 0),
-    ]
-    assert result.schedule.status == "OPTIMAL"
-    assert result.schedule.stage_two_status == "OPTIMAL"
-    assert result.schedule.warnings == [
-        "Có 3 person-slots vượt nhu cầu theo nhóm/slot."
+    assert result.interval_results[0].calls == 1.5
+    assert result.interval_results[0].erlang.required_staff == 1
+    assert captured[0].calls_per_hour == 3.0
+    assert captured[0].aht_seconds == 60.0
+    assert [item.start for item in result.interval_results] == [
+        "08:00",
+        "08:00",
+        "08:30",
+        "08:30",
     ]
 
 
-def test_erlang_decimal_boundary_keeps_one_employee_schedule_feasible():
-    request_payload = payload(
-        volumes={8: 12, 9: 0},
-        employees=[employee("e1")],
-    )
-    request_payload["aht_seconds"] = 60
-    request_payload["target_sla"] = 0.8
-    request_payload["waiting_seconds"] = 0
+def test_history_forecast_uses_explicit_window_and_distinct_prior_dates():
+    request = PipelineRequest.model_validate(payload(mode="history"))
 
-    result = run_pipeline(PipelineRequest.model_validate(request_payload))
-
-    assert result.hourly_results[0].erlang.required_staff == 1
-    assert result.hourly_results[0].erlang.service_level == 0.8
-    assert result.requirements[0].required_staff == 1
-    assert result.requirements[1].required_staff == 1
-    assert result.schedule.status in {"OPTIMAL", "FEASIBLE"}
-    assert len(result.schedule.assignments) == 1
-    assert result.schedule.assignments[0].start == "08:00"
-    assert len(result.schedule.assignments[0].groups_by_slot) == 3
-
-
-def test_history_mode_preserves_fractional_forecast_and_sample_count_without_leakage():
-    request_payload = payload(mode="history")
-    del request_payload["planned_calls"]
-    request_payload["history"] = [
-        {"date": day, "hour": hour, "group_id": "sales", "calls": calls}
-        for day, calls_by_hour in (
-            ("2026-10-19", {8: 12, 9: 0}),
-            ("2026-10-26", {8: 13, 9: 0}),
-        )
-        for hour, calls in calls_by_hour.items()
-    ]
-
-    result = run_pipeline(PipelineRequest.model_validate(request_payload))
+    result = run_pipeline(request)
 
     assert result.mode == "history"
-    assert result.forecast.forecasts[0].forecast_calls == 12.5
+    assert result.forecast.forecasts[0].forecast_calls == 3
     assert result.forecast.forecasts[0].sample_count == 2
-    assert result.hourly_results[0].calls_per_hour == 12.5
-    assert result.hourly_results[0].sample_count == 2
+    assert result.interval_results[0].calls == 3
+    assert "source_status" not in result.interval_results[0].model_dump()
 
 
-def test_zero_volume_has_no_service_level_and_can_return_empty_schedule():
-    request_payload = payload(
-        volumes={8: 0, 9: 0},
-        employees=[],
-        shift_starts=[],
-    )
-
-    result = run_pipeline(PipelineRequest.model_validate(request_payload))
-
-    assert all(item.erlang.required_staff == 0 for item in result.hourly_results)
-    assert all(item.erlang.service_level is None for item in result.hourly_results)
-    assert result.schedule.status == "OPTIMAL"
-    assert result.schedule.assignments == []
-
-
-def test_missing_duplicate_and_extra_hourly_rows_are_rejected():
-    missing = payload()
-    missing["planned_calls"].pop()
-    duplicate = payload()
-    duplicate["planned_calls"].append(deepcopy(duplicate["planned_calls"][0]))
-    extra = payload()
-    extra["planned_calls"].append(
-        {"date": WEEK, "hour": 10, "group_id": "sales", "calls_per_hour": 0}
-    )
-
-    for invalid in (missing, duplicate, extra):
+def test_history_rejects_rows_outside_window_or_on_cutoff():
+    for day in ("2026-09-28", WEEK):
+        request = payload(mode="history")
+        request["history"][0]["date"] = day
         with pytest.raises(ValidationError):
-            PipelineRequest.model_validate(invalid)
+            PipelineRequest.model_validate(request)
 
 
-@pytest.mark.parametrize(
-    ("field", "value"),
-    [
-        ("calls_per_hour", True),
-        ("calls_per_hour", "12"),
-        ("calls_per_hour", -1),
-        ("calls_per_hour", math.nan),
-        ("date", "2026-11-2"),
-        ("group_id", " "),
-    ],
-)
-def test_planned_call_rows_reject_coercion_and_malformed_values(field, value):
-    invalid = payload()
-    invalid["planned_calls"][0][field] = value
+def test_history_rejects_undeclared_group_rows():
+    request = payload(
+        mode="history",
+        groups=[{"id": "sales", "name": "Sales"}],
+        operating=[{"date": WEEK, "start": "08:00", "end": "08:30"}],
+    )
+    request["employees"] = [employee(skills=("sales",), slots=("08:00",))]
+    request["shifts"] = [
+        {"date": WEEK, "start": "08:00", "end": "08:30", "breaks": []}
+    ]
+    request["history"] = [
+        {"date": "2026-10-19", "start": "08:00", "group_id": "sales", "calls": 0},
+        {"date": "2026-10-26", "start": "08:00", "group_id": "sales", "calls": 0},
+        {"date": "2026-10-19", "start": "08:00", "group_id": "queue999", "calls": 999},
+        {"date": "2026-10-26", "start": "08:00", "group_id": "queue999", "calls": 999},
+    ]
 
     with pytest.raises(ValidationError):
-        PipelineRequest.model_validate(invalid)
+        PipelineRequest.model_validate(request)
 
 
-def test_request_rejects_missing_or_multiple_sources_and_direct_history_leakage():
-    missing = payload()
-    del missing["planned_calls"]
-    both = payload()
-    both["history"] = [
-        {"date": "2026-10-19", "hour": 8, "group_id": "sales", "calls": 1}
+def test_missing_history_rows_are_not_zero_filled():
+    request = payload(mode="history")
+    request["history"] = [
+        item for item in request["history"] if item["group_id"] == "sales"
     ]
-
-    for invalid in (missing, both):
-        with pytest.raises(ValidationError):
-            PipelineRequest.model_validate(invalid)
-
-
-@pytest.mark.parametrize(
-    ("change", "message"),
-    [
-        (lambda data: data["operating_hours"][0].update(hour=23), "23:30"),
-        (lambda data: data["operating_hours"][0].update(date="2026-10-31"), "week"),
-        (lambda data: data["operating_hours"][0].update(hour=True), "hour"),
-        (lambda data: data["operating_hours"].append(data["operating_hours"][0]), "unique"),
-        (lambda data: data["operating_hours"][1].update(hour=11), "contiguous"),
-    ],
-)
-def test_operating_grid_rejects_unsupported_or_malformed_hours(change, message):
-    invalid = payload()
-    change(invalid)
-
-    with pytest.raises(ValidationError, match=message):
-        PipelineRequest.model_validate(invalid)
-
-
-def test_history_without_matching_target_group_fails_with_safe_domain_error():
-    request_payload = payload(mode="history")
-    del request_payload["planned_calls"]
-    request_payload["history"] = [
-        {"date": day, "hour": hour, "group_id": "other", "calls": 2}
-        for day in ("2026-10-19", "2026-10-26")
-        for hour in (8, 9)
-    ]
-
     with pytest.raises(PipelineDomainError) as error:
-        run_pipeline(PipelineRequest.model_validate(request_payload))
+        run_pipeline(PipelineRequest.model_validate(request))
     assert error.value.public_message == (
         "History has insufficient prior samples for one or more targets."
     )
 
 
-def test_history_inside_scheduling_week_is_rejected_to_prevent_leakage():
-    request_payload = payload(mode="history", hours=(8,), employees=[], shift_starts=[])
-    del request_payload["planned_calls"]
-    request_payload["operating_hours"] = operating_hours(hours=(8,), day="2026-11-03")
-    request_payload["history"] = [
-        {"date": day, "hour": 8, "group_id": "sales", "calls": 2}
-        for day in ("2026-10-20", "2026-10-27", "2026-11-02")
+def test_duplicate_history_rows_and_off_grid_rows_are_rejected():
+    duplicate = payload(mode="history")
+    duplicate["history"].append(deepcopy(duplicate["history"][0]))
+    off_grid = payload(mode="history")
+    off_grid["history"][0]["start"] = "08:15"
+    for request in (duplicate, off_grid):
+        with pytest.raises(ValidationError):
+            PipelineRequest.model_validate(request)
+
+
+def test_planned_rows_must_cover_every_slot_and_group_including_zero():
+    for mutation in (
+        lambda request: request["planned_calls"].pop(),
+        lambda request: request["planned_calls"].append(
+            deepcopy(request["planned_calls"][0])
+        ),
+    ):
+        invalid = payload()
+        mutation(invalid)
+        with pytest.raises(ValidationError):
+            PipelineRequest.model_validate(invalid)
+
+
+def test_planned_rows_accept_full_3360_cell_week_through_24_00():
+    request = full_week_planned_payload()
+
+    validated = PipelineRequest.model_validate(request)
+
+    assert len(validated.planned_calls) == 3_360
+    assert validated.operating_intervals[0].end == "24:00"
+    assert validated.planned_calls[-1].start == "23:30"
+    assert validated.aht_by_group == []
+
+
+def test_planned_rows_reject_3361_cells():
+    request = full_week_planned_payload()
+    request["planned_calls"].append(deepcopy(request["planned_calls"][0]))
+
+    with pytest.raises(ValidationError):
+        PipelineRequest.model_validate(request)
+
+
+def test_explicit_zero_is_valid_and_needs_no_aht():
+    request = payload(calls={})
+    request["aht_by_group"] = []
+    request["employees"] = []
+    request["shifts"] = []
+
+    result = run_pipeline(PipelineRequest.model_validate(request))
+    assert all(item.erlang.required_staff == 0 for item in result.interval_results)
+    assert all(item.erlang.service_level is None for item in result.interval_results)
+    assert result.schedule.total_shift_minutes == 0
+
+
+def test_positive_calls_without_group_aht_are_domain_error():
+    request = payload(calls={("08:00", "sales"): 1.0})
+    request["aht_by_group"] = [
+        item for item in request["aht_by_group"] if item["group_id"] != "sales"
+    ]
+    with pytest.raises(PipelineDomainError) as error:
+        run_pipeline(PipelineRequest.model_validate(request))
+    assert error.value.public_message == (
+        "AHT seconds are required for groups with positive calls."
+    )
+
+
+@pytest.mark.parametrize(
+    "edit",
+    [
+        lambda request: request["service_targets"].pop(),
+        lambda request: request["service_targets"].append(
+            deepcopy(request["service_targets"][0])
+        ),
+        lambda request: request["groups"][0].update(id=" "),
+        lambda request: request["planned_calls"][0].update(calls=math.nan),
+        lambda request: request["planned_calls"][0].update(calls=True),
+    ],
+)
+def test_service_targets_groups_and_call_values_are_validated(edit):
+    request = payload()
+    edit(request)
+    with pytest.raises(ValidationError):
+        PipelineRequest.model_validate(request)
+
+
+@pytest.mark.parametrize(
+    "summary",
+    [
+        {"group_id": "sales", "aht_seconds": 0.0, "sample_count": 2, "cutoff_before": WEEK},
+        {"group_id": "sales", "aht_seconds": 60.0, "sample_count": 0, "cutoff_before": WEEK},
+        {"group_id": "sales", "aht_seconds": 60.0, "sample_count": 2, "cutoff_before": "2026-11-03"},
+    ],
+)
+def test_aht_summary_values_and_cutoff_are_validated(summary):
+    request = payload(calls={("08:00", "sales"): 1.0})
+    request["aht_by_group"] = [summary]
+    with pytest.raises(ValidationError):
+        PipelineRequest.model_validate(request)
+
+
+def test_disjoint_operating_intervals_remain_disjoint():
+    day = WEEK
+    operating = [
+        {"date": day, "start": "08:00", "end": "09:00"},
+        {"date": day, "start": "13:00", "end": "14:00"},
+    ]
+    slots = ("08:00", "08:30", "13:00", "13:30")
+    request = payload(
+        operating=operating,
+        employees=[
+            employee(
+                slots=slots,
+            )
+        ],
+        shifts=[{"date": day, "start": "08:00", "end": "09:00", "breaks": []}],
+    )
+    request["planned_calls"] = planned_rows(slots=slots)
+
+    result = run_pipeline(PipelineRequest.model_validate(request))
+    assert [item.start for item in result.interval_results] == [
+        "08:00",
+        "08:00",
+        "08:30",
+        "08:30",
+        "13:00",
+        "13:00",
+        "13:30",
+        "13:30",
     ]
 
-    with pytest.raises(ValidationError, match="before week_start"):
-        PipelineRequest.model_validate(request_payload)
 
-
-def test_erlang_target_above_solver_cap_is_a_clear_input_error_not_infeasible():
-    request_payload = payload(
-        volumes={8: 60, 9: 0},
-        employees=[],
-        max_agents=100,
+def test_stage_variable_budget_is_sanitized_as_known_domain_error(monkeypatch):
+    monkeypatch.setattr(pipeline, "MAX_ASSIGNMENT_VARIABLES", 0, raising=False)
+    monkeypatch.setattr(
+        pipeline,
+        "solve_schedule_v2",
+        lambda request: pytest.fail("budget should reject before the solver call"),
     )
-    request_payload["aht_seconds"] = 3600
-    request_payload["target_sla"] = 0.1
-    request_payload["waiting_seconds"] = 0
-
-    with pytest.raises(ValueError, match="exceeding.*50"):
-        run_pipeline(PipelineRequest.model_validate(request_payload))
-
-
-def test_erlang_search_limit_failure_is_not_mapped_to_solver_status():
-    request_payload = payload(max_agents=2, employees=[])
-
-    with pytest.raises(ValueError, match="max_agents=2"):
-        run_pipeline(PipelineRequest.model_validate(request_payload))
-
-
-def test_shift_start_and_availability_must_fit_generated_operating_slots():
-    shift_outside = payload(shift_starts=[{"date": WEEK, "start": "07:30"}])
-    availability_outside = payload()
-    availability_outside["employees"][0]["available_slots"].append(
-        {"date": WEEK, "start": "10:00"}
+    request = PipelineRequest.model_validate(payload())
+    monkeypatch.setattr(
+        pipeline,
+        "solve_schedule_v2",
+        lambda request: (_ for _ in ()).throw(
+            pipeline.SolverModelSizeError("private variable budget detail")
+        ),
     )
 
-    with pytest.raises(ValidationError, match="three operating slots"):
-        run_pipeline(PipelineRequest.model_validate(shift_outside))
-    with pytest.raises(ValidationError, match="must be operating slots"):
-        run_pipeline(PipelineRequest.model_validate(availability_outside))
+    with pytest.raises(PipelineDomainError) as error:
+        run_pipeline(request)
+    assert error.value.public_message == (
+        "The schedule exceeds the prototype assignment-variable limit."
+    )
+    assert "private" not in error.value.public_message
+
+
+def test_unexpected_solver_validation_error_is_not_rewritten(monkeypatch):
+    marker = "unexpected internal model validation"
+    monkeypatch.setattr(
+        pipeline,
+        "solve_schedule_v2",
+        lambda request: (_ for _ in ()).throw(ValidationError.from_exception_data(
+            "Internal", [{"type": "value_error", "loc": (), "input": None, "ctx": {"error": ValueError(marker)}}]
+        )),
+    )
+    with pytest.raises(ValidationError):
+        run_pipeline(PipelineRequest.model_validate(payload()))
 
 
 def test_infeasible_schedule_status_is_preserved():
-    request_payload = payload(
-        groups=("sales", "support"),
-        volumes={
-            (8, "sales"): 12,
-            (9, "sales"): 0,
-            (8, "support"): 0,
-            (9, "support"): 0,
-        },
-        employees=[employee("e1", skills=("support",))],
-        shift_starts=[{"date": WEEK, "start": "08:00"}],
+    request = payload(
+        calls={("08:00", "sales"): 1.0},
+        employees=[],
+        shifts=[],
     )
-
-    result = run_pipeline(PipelineRequest.model_validate(request_payload))
-
+    result = run_pipeline(PipelineRequest.model_validate(request))
     assert result.schedule.status == "INFEASIBLE"
     assert result.schedule.assignments == []
     assert result.schedule.stage_two_status is None
@@ -315,11 +420,11 @@ def test_unknown_solver_phase_and_warnings_are_returned_unchanged(monkeypatch):
         status="FEASIBLE",
         assignments=[],
         skill_mismatch_slots=0,
-        total_employee_slots=0,
+        total_shift_minutes=0,
         overstaff_slots=0,
         stage_two_status="UNKNOWN",
-        warnings=["solver warning"],
-        message="stage two did not finish",
+        warnings=["synthetic solver warning"],
+        message="synthetic solver status",
     )
     monkeypatch.setattr(pipeline, "solve_schedule_v2", lambda request: solver_result)
 
@@ -328,54 +433,4 @@ def test_unknown_solver_phase_and_warnings_are_returned_unchanged(monkeypatch):
     assert result.schedule == solver_result
     assert result.schedule.status == "FEASIBLE"
     assert result.schedule.stage_two_status == "UNKNOWN"
-    assert result.schedule.warnings == ["solver warning"]
-
-
-def test_skill_fallback_warning_is_preserved_from_solver():
-    request_payload = payload(
-        groups=("sales", "support"),
-        volumes={
-            (8, "sales"): 0.5,
-            (9, "sales"): 0,
-            (8, "support"): 0,
-            (9, "support"): 0,
-        },
-        employees=[employee("e1", skills=("support",))],
-        allow_skill_fallback=True,
-    )
-
-    result = run_pipeline(PipelineRequest.model_validate(request_payload))
-
-    assert result.schedule.status == "OPTIMAL"
-    assert result.schedule.skill_mismatch_slots == 2
-    assert result.schedule.warnings == [
-        "Skill fallback đã dùng: 2 person-slots lệch kỹ năng.",
-        "Có 1 person-slots vượt nhu cầu theo nhóm/slot.",
-    ]
-    assert result.schedule.stage_two_status == "OPTIMAL"
-
-
-def test_multiskill_employee_is_not_counted_for_two_groups_in_one_slot():
-    groups = ("sales", "support")
-    request_payload = payload(
-        groups=groups,
-        volumes={8: 0.5, 9: 0},
-        employees=[
-            employee("multi", skills=groups),
-            employee("second", skills=groups),
-        ],
-    )
-
-    result = run_pipeline(PipelineRequest.model_validate(request_payload))
-
-    assert result.schedule.status == "OPTIMAL"
-    for start in ("08:00", "08:30"):
-        assigned = [
-            (assignment.employee_id, slot.group_id)
-            for assignment in result.schedule.assignments
-            for slot in assignment.groups_by_slot
-            if slot.start == start
-        ]
-        assert len(assigned) == 2
-        assert {group for _, group in assigned} == set(groups)
-        assert len({employee_id for employee_id, _ in assigned}) == 2
+    assert result.schedule.warnings == ["synthetic solver warning"]

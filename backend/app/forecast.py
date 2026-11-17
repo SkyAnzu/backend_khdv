@@ -1,26 +1,24 @@
-"""Deterministic same-weekday/hour/group call-volume baseline."""
+"""Deterministic same-weekday/start/group interval call-volume baseline."""
 
-from .models import ForecastRequest, ForecastResponse, HourlyForecast
+from .models import ForecastRequest, ForecastResponse, IntervalForecast
 
 
 def forecast_calls(request: ForecastRequest) -> ForecastResponse:
-    """Average prior observations with the same weekday, hour, and group."""
-    history_by_key: dict[tuple[int, int, str], list[int]] = {}
+    """Average observations inside the explicit window by weekday/start/group."""
+    history_by_key: dict[tuple[int, str, str], list[int]] = {}
     for point in request.history:
-        key = (point.date.weekday(), point.hour, point.group_id)
+        key = (point.date.weekday(), point.start, point.group_id)
         history_by_key.setdefault(key, []).append(point.calls)
 
     forecasts = []
     for target in sorted(
-        request.targets, key=lambda point: (point.date, point.hour, point.group_id)
+        request.targets, key=lambda point: (point.date, point.start, point.group_id)
     ):
-        samples = history_by_key[
-            (target.date.weekday(), target.hour, target.group_id)
-        ]
+        samples = history_by_key[(target.date.weekday(), target.start, target.group_id)]
         forecasts.append(
-            HourlyForecast(
+            IntervalForecast(
                 date=target.date,
-                hour=target.hour,
+                start=target.start,
                 group_id=target.group_id,
                 forecast_calls=sum(samples) / len(samples),
                 sample_count=len(samples),
