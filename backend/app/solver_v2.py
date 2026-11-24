@@ -364,6 +364,7 @@ class SolverV2Request(_StrictModel):
     employees: list[EmployeeV2] = Field(max_length=MAX_EMPLOYEES)
     shifts: list[ShiftOption] = Field(max_length=MAX_SHIFT_CANDIDATES)
     allow_skill_fallback: StrictBool = False
+    allow_understaffing: StrictBool = False
     max_solve_seconds: StrictInt = Field(default=10, ge=1, le=MAX_SOLVE_SECONDS)
 
     @field_validator("week_start", mode="before")
@@ -472,6 +473,7 @@ class SolverV2Response(_StrictModel):
     skill_mismatch_slots: StrictInt | None
     total_shift_minutes: StrictInt | None
     overstaff_slots: StrictInt | None
+    understaff_slots: StrictInt | None = None
     stage_two_status: SolverStatus | None = None
     warnings: list[StrictStr]
     message: StrictStr
@@ -620,7 +622,14 @@ def _response_with_schedule(
     overstaff_slots = sum(
         max(0, count - demand.get(key, 0)) for key, count in assigned.items()
     )
+    understaff_slots = sum(
+        max(0, req - assigned.get(key, 0)) for key, req in demand.items()
+    )
     warnings = []
+    if understaff_slots:
+        warnings.append(
+            f"Còn thiếu {understaff_slots} lượt người (khung 30 phút) so với nhu cầu."
+        )
     if mismatch_slots:
         warnings.append(
             f"Skill fallback đã dùng: {mismatch_slots} person-slots lệch kỹ năng."
@@ -635,6 +644,7 @@ def _response_with_schedule(
         skill_mismatch_slots=mismatch_slots,
         total_shift_minutes=total_minutes,
         overstaff_slots=overstaff_slots,
+        understaff_slots=understaff_slots,
         stage_two_status=stage_two_status,
         warnings=warnings,
         message=message,
@@ -648,6 +658,7 @@ def _empty_response(status: SolverStatus, message: str) -> SolverV2Response:
         skill_mismatch_slots=None,
         total_shift_minutes=None,
         overstaff_slots=None,
+        understaff_slots=None,
         warnings=[],
         message=message,
     )
@@ -719,17 +730,27 @@ def solve_schedule_v2(request: SolverV2Request) -> SolverV2Response:
         if employee.min_days_off_per_week is not None:
             model.add(sum(worked_days) <= 7 - employee.min_days_off_per_week)
 
-    for requirement in request.requirements:
-        model.add(
-            sum(
-                coverage_vars.get(
-                    (requirement.date, requirement.start, requirement.group_id), []
-                )
+    understaff_vars: list[cp_model.IntVar] = []
+    for req_index, requirement in enumerate(request.requirements):
+        slot_coverage = sum(
+            coverage_vars.get(
+                (requirement.date, requirement.start, requirement.group_id), []
             )
-            >= requirement.required_staff
         )
+        if request.allow_understaffing and requirement.required_staff > 0:
+            slack = model.new_int_var(
+                0, requirement.required_staff, f"understaff_{req_index}"
+            )
+            model.add(slot_coverage + slack >= requirement.required_staff)
+            understaff_vars.append(slack)
+        else:
+            model.add(slot_coverage >= requirement.required_staff)
 
-    model.minimize(sum(mismatch_vars))
+    if understaff_vars:
+        understaff_weight = len(mismatch_vars) + 1
+        model.minimize(understaff_weight * sum(understaff_vars) + sum(mismatch_vars))
+    else:
+        model.minimize(sum(mismatch_vars))
     solve_start = time.monotonic()
     first_solver = _new_solver(request.max_solve_seconds)
     first_status = _map_solver_status(first_solver.solve(model))
@@ -749,9 +770,14 @@ def solve_schedule_v2(request: SolverV2Request) -> SolverV2Response:
             request,
             first_assignments,
             "FEASIBLE",
-            "Có lịch hợp lệ; mục tiêu ưu tiên kỹ năng chưa được chứng minh tối ưu.",
+            "Có lịch hợp lệ; mục tiêu ưu tiên độ phủ/kỹ năng chưa được chứng minh tối ưu.",
         )
 
+    if understaff_vars:
+        best_understaff = sum(
+            first_solver.value(variable) for variable in understaff_vars
+        )
+        model.add(sum(understaff_vars) == best_understaff)
     best_mismatches = sum(first_solver.value(variable) for variable in mismatch_vars)
     if mismatch_vars:
         model.add(sum(mismatch_vars) == best_mismatches)
@@ -806,7 +832,9 @@ def solve_schedule_v2(request: SolverV2Request) -> SolverV2Response:
             return incumbent
         if second_status == "OPTIMAL":
             candidate.message = (
-                "Đã chứng minh tối ưu tuần tự: trước hết lệch kỹ năng, sau đó "
+                "Đã xếp tối đa nhân sự hiện có, sau đó giảm lệch kỹ năng và tổng phút ca."
+                if candidate.understaff_slots
+                else "Đã chứng minh tối ưu tuần tự: trước hết lệch kỹ năng, sau đó "
                 "tổng phút ca."
             )
         return candidate

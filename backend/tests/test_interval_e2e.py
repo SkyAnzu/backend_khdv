@@ -15,6 +15,45 @@ FIXTURES = Path(__file__).parent / "data" / "database_sample"
 SAMPLES = Path(__file__).parent.parent / "samples"
 
 
+def test_positive_demand_accepts_explicit_estimate_without_sample_metadata():
+    sample = next(SAMPLES.glob('*planned*request.json'))
+    request = json.loads(sample.read_text(encoding='utf-8'))
+    measured = request['aht_by_group'][0]
+    request['aht_by_group'] = [{
+        'group_id': measured['group_id'], 'aht_seconds': measured['aht_seconds'],
+        'source': 'estimate',
+    }]
+    response = client.post('/api/schedule-v2', json=request)
+    assert response.status_code == 200, response.text
+    request['aht_by_group'][0]['sample_count'] = 1
+    assert client.post('/api/schedule-v2', json=request).status_code == 422
+
+
+def test_allow_understaffing_produces_best_effort_schedule_and_exports():
+    sample = next(SAMPLES.glob('*planned*request.json'))
+    request = json.loads(sample.read_text(encoding='utf-8'))
+    # Crank up calls so 1 employee cannot meet Erlang C demand
+    request['planned_calls'][0]['calls'] = 20.0
+
+    strict = client.post('/api/schedule-v2', json=request)
+    assert strict.status_code == 200, strict.text
+    strict_body = strict.json()
+    assert strict_body['schedule']['status'] == 'INFEASIBLE'
+    assert strict_body['schedule']['assignments'] == []
+    assert strict_body['schedule']['understaff_slots'] is None
+
+    soft = {**request, 'allow_understaffing': True}
+    result, csv_rows = schedule_export(soft)
+    assert result['schedule']['status'] == 'OPTIMAL'
+    assert len(result['schedule']['assignments']) == 1
+    assert result['schedule']['understaff_slots'] > 0
+    assert result['schedule']['overstaff_slots'] == 0
+    assert any('Còn thiếu' in w for w in result['schedule']['warnings'])
+    assert result['interval_results'][0]['assigned_staff'] == 1
+    assert result['interval_results'][0]['erlang']['required_staff'] > 1
+    assert len(csv_rows) > 1
+
+
 def database_bundle():
     output = io.BytesIO()
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
