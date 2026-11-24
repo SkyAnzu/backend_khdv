@@ -28,15 +28,19 @@ Lưới demand và lịch là **30 phút**. Mỗi row history/planned có đúng
 - Erlang C chạy độc lập cho từng queue/interval với
   `calls_per_hour = 2 * calls_in_30_minutes`; AHT vẫn tính bằng giây và không
   chia đôi. SLA fraction và `waiting_seconds` được cấu hình riêng theo queue.
-  Positive calls cần AHT hợp lệ; zero calls trả 0 nhân viên và SLA `null`, không
-  cần AHT.
+  Positive calls cần AHT hợp lệ (dạng đã đo có `sample_count`, `cutoff_before`
+  hoặc dạng ước tính tường minh `{group_id, aht_seconds, source: "estimate"}`);
+  zero calls trả 0 nhân viên và SLA `null`, không cần AHT.
 - `groups` dùng `{id,name}`; `operating_intervals` là các range ngày có thể rời
   nhau. `shifts` là occurrences cùng ngày `{date,start,end,breaks}`. Break không
   tạo coverage nhưng toàn thời lượng elapsed của ca (gồm break) tính vào cap
   tuần và mục tiêu phút. Không có overnight shift; `24:00` chỉ là endpoint loại
   trừ.
-- Solver giữ hard skill mặc định, fallback tường minh có warning và
-  `min_days_off_per_week` tùy chọn. Không thêm daily cap, labor/rest defaults,
+- Solver giữ hard skill và hard coverage mặc định; hỗ trợ `allow_skill_fallback`
+  và `allow_understaffing` tường minh có warning, cùng `min_days_off_per_week`
+  tùy chọn. Khi `allow_understaffing: true`, solver dùng biến bù thiếu và tối ưu
+  tuần tự lượt thiếu người → lệch kỹ năng → tổng phút ca, trả kèm
+  `understaff_slots` trong `schedule`. Không thêm daily cap, labor/rest defaults,
   wages, fairness hoặc headcount objective. `INFEASIBLE`, `UNKNOWN` và
   `MODEL_INVALID` được trả như status solver, không phải HTTP validation errors.
 - Response có `mode`, `forecast`, `groups`, `interval_results` và `schedule`;

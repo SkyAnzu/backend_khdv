@@ -111,11 +111,9 @@ class PipelineServiceTarget(_StrictModel):
         return value
 
 
-class PipelineAHTSummary(_StrictModel):
+class _PipelineAHTValue(_StrictModel):
     group_id: StrictStr
     aht_seconds: StrictFloat = Field(gt=0, allow_inf_nan=False)
-    sample_count: StrictInt = Field(ge=1)
-    cutoff_before: date
 
     @field_validator("group_id")
     @classmethod
@@ -125,10 +123,19 @@ class PipelineAHTSummary(_StrictModel):
             raise ValueError("group id must be non-empty and bounded")
         return value
 
+
+class PipelineAHTSummary(_PipelineAHTValue):
+    sample_count: StrictInt = Field(ge=1)
+    cutoff_before: date
+
     @field_validator("cutoff_before", mode="before")
     @classmethod
     def cutoff_is_iso(cls, value: object) -> date:
         return _parse_date(value)
+
+
+class PipelineAHTEstimate(_PipelineAHTValue):
+    source: Literal["estimate"]
 
 
 class PipelineRequest(_StrictModel):
@@ -143,8 +150,9 @@ class PipelineRequest(_StrictModel):
     service_targets: list[PipelineServiceTarget] = Field(
         min_length=1, max_length=MAX_GROUPS
     )
-    aht_by_group: list[PipelineAHTSummary] = Field(max_length=MAX_GROUPS)
+    aht_by_group: list[PipelineAHTSummary | PipelineAHTEstimate] = Field(max_length=MAX_GROUPS)
     allow_skill_fallback: StrictBool = False
+    allow_understaffing: StrictBool = False
     max_solve_seconds: StrictInt = Field(default=10, ge=1, le=MAX_SOLVE_SECONDS)
     max_agents: StrictInt = Field(
         default=MAX_ERLANG_C_AGENTS,
@@ -192,7 +200,10 @@ class PipelineRequest(_StrictModel):
             raise ValueError("AHT summaries must be unique by group")
         if not set(aht_group_ids) <= group_set:
             raise ValueError("AHT summaries must use declared groups")
-        if any(item.cutoff_before > self.week_start for item in self.aht_by_group):
+        if any(
+            isinstance(item, PipelineAHTSummary) and item.cutoff_before > self.week_start
+            for item in self.aht_by_group
+        ):
             raise ValueError("AHT cutoff_before must not be after week_start")
 
         operating_intervals = sorted(
@@ -446,6 +457,7 @@ def run_pipeline(request: PipelineRequest) -> PipelineResponse:
             "employees": request.employees,
             "shifts": request.shifts,
             "allow_skill_fallback": request.allow_skill_fallback,
+            "allow_understaffing": request.allow_understaffing,
             "max_solve_seconds": request.max_solve_seconds,
         }
     )
