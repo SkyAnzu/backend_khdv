@@ -54,7 +54,7 @@ assignment có thể thay đổi khi chạy lại solver.
 
 ## Giới hạn và cấu hình body
 
-Prototype giữ giới hạn 50 nhân viên, 10 nhóm, 336 operating slots, 3.360 planned
+Prototype giữ giới hạn 100 nhân viên, 10 nhóm, 336 operating slots, 3.360 planned
 rows, 200 shift candidates, 100.000 history rows và tối đa 30 giây solve-phase
 budget. Cap 3.360 là `336 operating slots × 10 groups`, dùng chung cho planned
 JSON và generic planned CSV/XLSX; generic history import vẫn tối đa 10.000 rows.

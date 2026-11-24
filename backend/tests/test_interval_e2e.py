@@ -307,3 +307,33 @@ def test_explicit_infeasible_availability_preserves_solver_status_and_null_staff
     assert result["schedule"]["status"] == "INFEASIBLE"
     assert result["schedule"]["assignments"] == []
     assert all(item["assigned_staff"] is None for item in result["interval_results"])
+
+
+def test_planned_request_accepts_100_employees_and_rejects_101():
+    request = json.loads(
+        (SAMPLES / "pipeline-planned-calls-request.json").read_text(encoding="utf-8")
+    )
+    template = request["employees"][0]
+    request["employees"] = [
+        {**template, "id": f"TEST-e{index:03d}"} for index in range(1, 101)
+    ]
+    request["planned_calls"][0]["calls"] = 300.0
+
+    result, csv_rows = schedule_export(request)
+
+    interval = next(
+        item for item in result["interval_results"] if item["start"] == "08:00"
+    )
+    assert interval["erlang"]["required_staff"] == 57
+    assert interval["assigned_staff"] == 57
+    assert csv_rows[0][0] == "Mã nhân viên"
+    assert sum(row[2] == "08:00" for row in csv_rows[1:]) == 57
+    assert all(row[0].startswith("TEST-e") for row in csv_rows[1:])
+
+    request["employees"].append({**template, "id": "TEST-e101"})
+    response = client.post("/api/schedule-v2", json=request)
+    assert response.status_code == 422
+    assert any(
+        error["loc"] == ["body", "employees"]
+        for error in response.json()["detail"]
+    )

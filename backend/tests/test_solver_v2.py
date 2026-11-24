@@ -318,9 +318,11 @@ def test_demand_cannot_exceed_employee_bound():
     slots = slot_range()
     payload = make_payload(
         slots,
-        demands={(WEEK, "08:00", "sales"): 51},
+        demands={(WEEK, "08:00", "sales"): solver_v2.MAX_EMPLOYEES},
         groups=["sales"],
     )
+    SolverV2Request.model_validate(payload)
+    payload["requirements"][0]["required_staff"] += 1
 
     with pytest.raises(ValidationError):
         SolverV2Request.model_validate(payload)
@@ -335,9 +337,9 @@ def test_input_collection_limits_bound_request_size():
     invalid.append(too_many_groups)
     too_many_employees = deepcopy(base)
     too_many_employees["employees"] = [
-        deepcopy(base["employees"][0]) for _ in range(51)
+        {**base["employees"][0], "id": f"e{index}"}
+        for index in range(solver_v2.MAX_EMPLOYEES + 1)
     ]
-    invalid.append(too_many_employees)
     too_many_slots = deepcopy(base)
     too_many_slots["employees"][0]["available_slots"] = [
         {"date": WEEK, "start": "08:00"} for _ in range(337)
@@ -352,6 +354,10 @@ def test_input_collection_limits_bound_request_size():
     for item in invalid:
         with pytest.raises(ValidationError):
             SolverV2Request.model_validate(item)
+
+    with pytest.raises(ValidationError) as error:
+        SolverV2Request.model_validate(too_many_employees)
+    assert error.value.errors()[0]["loc"] == ("employees",)
 
 
 @pytest.mark.parametrize("field", ["available_slots", "max_shift_minutes_per_week"])

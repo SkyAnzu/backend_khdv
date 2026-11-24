@@ -272,11 +272,12 @@ def test_schedule_v2_rejects_legacy_hour_based_payload():
     )
 
 
-def test_schedule_v2_rejects_more_than_50_employees_before_solving():
+def test_schedule_v2_rejects_more_than_employee_limit_before_solving():
     request = load_sample("pipeline-planned-calls-request.json")
     employee = request["employees"][0]
     request["employees"] += [
-        {**employee, "id": f"e{index:02}"} for index in range(2, 52)
+        {**employee, "id": f"e{index:03}"}
+        for index in range(2, solver_v2.MAX_EMPLOYEES + 2)
     ]
 
     response = post_schedule(request)
