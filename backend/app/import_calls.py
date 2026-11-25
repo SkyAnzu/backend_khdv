@@ -8,6 +8,7 @@ import math
 from pathlib import PurePosixPath, PureWindowsPath
 import re
 from typing import Literal
+from xml.parsers import expat
 import zipfile
 
 from defusedxml.ElementTree import fromstring, iterparse
@@ -47,6 +48,10 @@ _INTEGER = re.compile(r"^[+-]?[0-9]+$")
 _CELL_REFERENCE = re.compile(r"^([A-Z]{1,3})([1-9][0-9]*)$")
 _XML_DECLARATION = re.compile(rb"\A<\?xml\s+([^?]*)\?>")
 _XML_ENCODING = re.compile(rb"\bencoding\s*=\s*(['\"])(.*?)\1")
+_XML_TAG_DELIMITER = re.compile(rb'[>"\']')
+_XML_OVERLONG_SIMPLE_TOKEN = re.compile(
+    rb"<[^>]{" + str(MAX_XLSX_XML_MARKUP_TOKEN_BYTES - 1).encode() + rb"}(?:>|[^>])"
+)
 _XLSX_WORKBOOK_CONTENT_TYPE = (
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"
 )
@@ -524,60 +529,67 @@ def _preflight_xml_part(
     element_count = 0
     depth = 0
     pending_namespaces = 0
+
+    def _forbid_xml(*_args: object) -> None:
+        raise CallImportError("XLSX XML part is invalid or unsafe.")
+
+    def _on_start_ns(_prefix: str | None, _uri: str | None) -> None:
+        nonlocal pending_namespaces
+        pending_namespaces += 1
+        if pending_namespaces > MAX_XLSX_XML_ATTRIBUTES_PER_ELEMENT:
+            raise CallImportError("XLSX XML element has too many attributes.")
+
+    def _on_start_element(tag: str, attrs: dict[str, str]) -> None:
+        nonlocal depth, element_count, pending_namespaces
+        depth += 1
+        element_count += 1
+        current_attributes = len(attrs) + pending_namespaces
+        pending_namespaces = 0
+        totals["elements"] += 1
+        totals["attributes"] += current_attributes
+        if depth > MAX_XLSX_XML_DEPTH:
+            raise CallImportError("XLSX XML exceeds the depth limit.")
+        if current_attributes > MAX_XLSX_XML_ATTRIBUTES_PER_ELEMENT:
+            raise CallImportError("XLSX XML element has too many attributes.")
+        if totals["attributes"] > MAX_XLSX_XML_ATTRIBUTES:
+            raise CallImportError("XLSX XML attribute count exceeds the limit.")
+        if totals["elements"] > MAX_XLSX_XML_ELEMENTS:
+            raise CallImportError("XLSX XML element count exceeds the limit.")
+        if element_count > element_limit:
+            if folded_name == "xl/styles.xml":
+                raise CallImportError(
+                    "XLSX styles XML exceeds the element limit."
+                )
+            if is_shared_strings:
+                raise CallImportError(
+                    "XLSX shared strings XML exceeds the element limit."
+                )
+            raise CallImportError("XLSX XML part exceeds the element limit.")
+        if is_shared_strings and tag.rsplit("}", 1)[-1] == "r":
+            raise CallImportError(
+                "XLSX shared strings rich text is not accepted."
+            )
+
+    def _on_end_element(_tag: str) -> None:
+        nonlocal depth
+        depth -= 1
+
     try:
-        for event, element in iterparse(
-            io.BytesIO(content),
-            events=("start", "end", "start-ns"),
-            forbid_dtd=True,
-            forbid_entities=True,
-            forbid_external=True,
-        ):
-            if event == "start-ns":
-                pending_namespaces += 1
-                if pending_namespaces > MAX_XLSX_XML_ATTRIBUTES_PER_ELEMENT:
-                    raise CallImportError(
-                        "XLSX XML element has too many attributes."
-                    )
-            elif event == "start":
-                depth += 1
-                element_count += 1
-                current_attributes = len(element.attrib) + pending_namespaces
-                pending_namespaces = 0
-                totals["elements"] += 1
-                totals["attributes"] += current_attributes
-                if depth > MAX_XLSX_XML_DEPTH:
-                    raise CallImportError("XLSX XML exceeds the depth limit.")
-                if current_attributes > MAX_XLSX_XML_ATTRIBUTES_PER_ELEMENT:
-                    raise CallImportError(
-                        "XLSX XML element has too many attributes."
-                    )
-                if totals["attributes"] > MAX_XLSX_XML_ATTRIBUTES:
-                    raise CallImportError(
-                        "XLSX XML attribute count exceeds the limit."
-                    )
-                if totals["elements"] > MAX_XLSX_XML_ELEMENTS:
-                    raise CallImportError(
-                        "XLSX XML element count exceeds the limit."
-                    )
-                if element_count > element_limit:
-                    if folded_name == "xl/styles.xml":
-                        raise CallImportError(
-                            "XLSX styles XML exceeds the element limit."
-                        )
-                    if is_shared_strings:
-                        raise CallImportError(
-                            "XLSX shared strings XML exceeds the element limit."
-                        )
-                    raise CallImportError(
-                        "XLSX XML part exceeds the element limit."
-                    )
-                if is_shared_strings and element.tag.rsplit("}", 1)[-1] == "r":
-                    raise CallImportError(
-                        "XLSX shared strings rich text is not accepted."
-                    )
-            else:
-                element.clear()
-                depth -= 1
+        parser = expat.ParserCreate(namespace_separator="}")
+        parser.SetParamEntityParsing(expat.XML_PARAM_ENTITY_PARSING_NEVER)
+        parser.StartDoctypeDeclHandler = _forbid_xml
+        parser.EntityDeclHandler = _forbid_xml
+        parser.UnparsedEntityDeclHandler = _forbid_xml
+        parser.ExternalEntityRefHandler = _forbid_xml
+        parser.StartNamespaceDeclHandler = _on_start_ns
+        parser.StartElementHandler = _on_start_element
+        parser.EndElementHandler = _on_end_element
+        chunk_size = 64 * 1024
+        for offset in range(0, len(content), chunk_size):
+            chunk = content[offset : offset + chunk_size]
+            parser.Parse(chunk, offset + chunk_size >= len(content))
+        if not content:
+            parser.Parse(b"", True)
     except CallImportError:
         raise
     except Exception:
@@ -606,48 +618,68 @@ def _preflight_xml_bytes(content: bytes) -> None:
 
 
 def _preflight_xml_markup_tokens(content: bytes) -> None:
+    content_len = len(content)
+    max_token = MAX_XLSX_XML_MARKUP_TOKEN_BYTES
+    next_dq = content.find(b'"')
+    next_sq = content.find(b"'")
+    next_bang = content.find(b"<!")
+    next_pi = content.find(b"<?")
     position = 0
     while (start := content.find(b"<", position)) >= 0:
-        if content.startswith(b"<!--", start):
-            end = content.find(b"-->", start + 4)
-            terminator_bytes = 3
-        elif content.startswith(b"<![CDATA[", start):
-            end = content.find(b"]]>", start + 9)
-            terminator_bytes = 3
-        elif content.startswith(b"<?", start):
-            end = content.find(b"?>", start + 2)
-            terminator_bytes = 2
-        else:
-            quote = None
-            end = start + 1
-            while end < len(content):
-                byte = content[end]
-                if quote is not None:
-                    if byte == quote:
-                        quote = None
-                elif byte in (ord('"'), ord("'")):
-                    quote = byte
-                elif byte == ord(">"):
-                    break
-                end += 1
-            if end == len(content):
-                if end - start > MAX_XLSX_XML_MARKUP_TOKEN_BYTES:
-                    raise CallImportError(
-                        "XLSX XML markup token exceeds the size limit."
-                    )
-                return
-            terminator_bytes = 1
-
-        if end < 0:
-            if len(content) - start > MAX_XLSX_XML_MARKUP_TOKEN_BYTES:
+        if 0 <= next_dq < start:
+            next_dq = content.find(b'"', start)
+        if 0 <= next_sq < start:
+            next_sq = content.find(b"'", start)
+        if 0 <= next_bang < start:
+            next_bang = content.find(b"<!", start)
+        if 0 <= next_pi < start:
+            next_pi = content.find(b"<?", start)
+        if next_dq < 0 and next_sq < 0 and next_bang < 0 and next_pi < 0:
+            if _XML_OVERLONG_SIMPLE_TOKEN.search(content, start) is not None:
                 raise CallImportError(
                     "XLSX XML markup token exceeds the size limit."
                 )
             return
-        token_end = end + terminator_bytes
-        if token_end - start > MAX_XLSX_XML_MARKUP_TOKEN_BYTES:
-            raise CallImportError("XLSX XML markup token exceeds the size limit.")
-        position = token_end
+        window_end = min(content_len, start + max_token)
+        if start == next_bang and content.startswith(b"<!--", start):
+            end = content.find(b"-->", start + 4, window_end)
+            terminator_bytes = 3
+        elif start == next_bang and content.startswith(b"<![CDATA[", start):
+            end = content.find(b"]]>", start + 9, window_end)
+            terminator_bytes = 3
+        elif start == next_pi:
+            end = content.find(b"?>", start + 2, window_end)
+            terminator_bytes = 2
+        else:
+            gt = content.find(b">", start + 1, window_end)
+            if (
+                gt >= 0
+                and (next_dq < 0 or next_dq >= gt)
+                and (next_sq < 0 or next_sq >= gt)
+            ):
+                position = gt + 1
+                continue
+            quote = None
+            end = -1
+            for match in _XML_TAG_DELIMITER.finditer(content, start + 1, window_end):
+                ch = match.group(0)
+                if quote is not None:
+                    if ch == quote:
+                        quote = None
+                elif ch == b">":
+                    end = match.start()
+                    break
+                else:
+                    quote = ch
+            terminator_bytes = 1
+
+        if end < 0:
+            if content_len - start > max_token:
+                raise CallImportError(
+                    "XLSX XML markup token exceeds the size limit."
+                )
+            return
+        position = end + terminator_bytes
 
 
 def _validate_package_xml(xml_parts: dict[str, bytes]) -> tuple[str, str | None]:
